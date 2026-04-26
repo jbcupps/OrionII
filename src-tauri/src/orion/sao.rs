@@ -122,11 +122,22 @@ impl SaoClientConfig {
     }
 
     /// Construct from a SAO-issued bundle config. The bearer here is the entity JWT.
+    #[allow(dead_code)] // back-compat helper kept for tests / external callers
     pub fn from_bundle(base_url: String, bearer_token: String, agent_id: Uuid) -> Self {
+        Self::from_bundle_anchor(base_url, bearer_token, Some(agent_id))
+    }
+
+    /// Bundle anchor — agent_id is optional because the live birth call is the canonical
+    /// source of identity (the JWT itself carries it via `sub`).
+    pub fn from_bundle_anchor(
+        base_url: String,
+        bearer_token: String,
+        agent_id: Option<Uuid>,
+    ) -> Self {
         Self {
             base_url: base_url.trim().trim_end_matches('/').to_string(),
             bearer_token,
-            agent_id: Some(agent_id),
+            agent_id,
         }
     }
 }

@@ -1,3 +1,4 @@
+pub mod birth;
 pub mod bootstrap;
 pub mod bus;
 pub mod curator;

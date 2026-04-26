@@ -2,6 +2,7 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::orion::birth::BirthResponse;
 use crate::orion::bootstrap::OrionBootstrap;
 use crate::orion::bus::{BusError, InProcessBus, LocalBus};
 use crate::orion::curator::CuratorRuntime;
@@ -55,6 +56,7 @@ pub struct OrionCore {
     oauth_catalog: OAuthSkillCatalog,
     verifier: ConstitutionalVerifier,
     sao_config: Option<SaoClientConfig>,
+    birth: Option<BirthResponse>,
 }
 
 impl Default for OrionCore {
@@ -100,6 +102,7 @@ impl OrionCore {
             oauth_catalog,
             verifier: ConstitutionalVerifier,
             sao_config: bootstrap.sao,
+            birth: bootstrap.birth,
         }
     }
 
@@ -119,7 +122,12 @@ impl OrionCore {
             oauth_catalog: OAuthSkillCatalog::default(),
             verifier: ConstitutionalVerifier,
             sao_config: None,
+            birth: None,
         }
+    }
+
+    pub fn birth(&self) -> Option<&BirthResponse> {
+        self.birth.as_ref()
     }
 
     pub fn send_chat_message(&mut self, text: String) -> Result<ChatExchange, OrionError> {

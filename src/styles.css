@@ -170,6 +170,75 @@ h1 {
   opacity: 0.6;
 }
 
+.enroll-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid rgba(255, 200, 120, 0.35);
+  border-radius: 1.2rem;
+  background: rgba(33, 24, 8, 0.45);
+  box-shadow: 0 1.25rem 3rem rgba(0, 0, 0, 0.2);
+}
+
+.enroll-panel .eyebrow {
+  color: #ffd28a;
+}
+
+.enroll-panel p {
+  margin: 0;
+  color: #d6dde8;
+  font-size: 0.86rem;
+}
+
+.enroll-panel code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0.05rem 0.35rem;
+  border-radius: 0.35rem;
+  font-size: 0.82em;
+}
+
+.enroll-panel textarea {
+  width: 100%;
+  min-height: 9rem;
+  resize: vertical;
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.32);
+  color: #eaf2ff;
+  font-family: ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.enroll-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.enroll-actions button {
+  border: 1px solid rgba(255, 211, 138, 0.55);
+  border-radius: 999px;
+  padding: 0.7rem 1.1rem;
+  color: #1a1102;
+  background: #ffd38a;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.enroll-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.enroll-feedback {
+  font-size: 0.82rem;
+  color: #ffe2b0;
+}
+
 .transcript {
   display: flex;
   flex-direction: column;
