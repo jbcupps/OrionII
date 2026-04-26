@@ -72,6 +72,14 @@ type SaoConnectionStatus = {
   configured: boolean;
   baseUrl: string | null;
   agentId: string | null;
+  birthed: boolean;
+  agentName: string | null;
+  ownerUsername: string | null;
+  provider: string | null;
+  idModel: string | null;
+  egoModel: string | null;
+  birthedAt: string | null;
+  policyVersion: number | null;
 };
 
 function payloadText(message: Message): string {
@@ -112,10 +120,21 @@ function App() {
   const [saoConnection, setSaoConnection] = useState<SaoConnectionStatus>({
     configured: false,
     baseUrl: null,
-    agentId: null
+    agentId: null,
+    birthed: false,
+    agentName: null,
+    ownerUsername: null,
+    provider: null,
+    idModel: null,
+    egoModel: null,
+    birthedAt: null,
+    policyVersion: null
   });
   const [syncStatus, setSyncStatus] = useState("SAO sync not checked");
   const [lastShipReport, setLastShipReport] = useState<ShipReport | null>(null);
+  const [pastedConfig, setPastedConfig] = useState("");
+  const [applyingConfig, setApplyingConfig] = useState(false);
+  const [configFeedback, setConfigFeedback] = useState<string | null>(null);
 
   const canSend = useMemo(() => draft.trim().length > 0 && !isSending, [draft, isSending]);
 
@@ -123,11 +142,19 @@ function App() {
     invoke<SaoConnectionStatus>("sao_connection_status")
       .then((connection) => {
         setSaoConnection(connection);
-        setSyncStatus(
-          connection.configured
-            ? `SAO configured at ${connection.baseUrl}`
-            : "Offline local mode; set SAO_BASE_URL and SAO_DEV_BEARER_TOKEN"
-        );
+        if (connection.birthed) {
+          setSyncStatus(
+            `Birthed as ${connection.agentName ?? "(unnamed)"} via ${connection.provider ?? "(no provider)"} (policy v${connection.policyVersion ?? 0})`
+          );
+        } else if (connection.configured) {
+          setSyncStatus(
+            `Anchor loaded at ${connection.baseUrl}; SAO unreachable — running on bundle defaults`
+          );
+        } else {
+          setSyncStatus(
+            "Offline local mode; drop config.json into %APPDATA%\\OrionII or set SAO_BASE_URL + SAO_DEV_BEARER_TOKEN"
+          );
+        }
       })
       .catch((cause) => setSyncStatus(`SAO status unavailable: ${String(cause)}`));
   }, []);
@@ -203,6 +230,40 @@ function App() {
     }
   }
 
+  async function applyPastedConfig() {
+    setError(null);
+    setConfigFeedback(null);
+    if (!pastedConfig.trim()) {
+      setConfigFeedback("Paste the bundle config.json above first.");
+      return;
+    }
+    setApplyingConfig(true);
+    try {
+      const result = await invoke<{
+        writtenTo: string;
+        status: SaoConnectionStatus;
+      }>("apply_bundle_config", { json: pastedConfig });
+      setSaoConnection(result.status);
+      setPastedConfig("");
+      if (result.status.birthed) {
+        setSyncStatus(
+          `Birthed as ${result.status.agentName ?? "(unnamed)"} via ${result.status.provider ?? "(no provider)"} (policy v${result.status.policyVersion ?? 0})`
+        );
+      } else if (result.status.configured) {
+        setSyncStatus(
+          `Anchor saved at ${result.writtenTo}; SAO unreachable — running on bundle defaults`
+        );
+      }
+      setConfigFeedback(`Saved to ${result.writtenTo}.`);
+    } catch (cause) {
+      setConfigFeedback(
+        `Apply failed: ${cause instanceof Error ? cause.message : String(cause)}`
+      );
+    } finally {
+      setApplyingConfig(false);
+    }
+  }
+
   async function shipSaoEgress() {
     setError(null);
     setIsSyncing(true);
@@ -267,7 +328,7 @@ function App() {
             </div>
             <div>
               <dt>SAO</dt>
-              <dd>{saoConnection.configured ? "configured" : "offline"}</dd>
+              <dd>{saoConnection.birthed ? "birthed" : saoConnection.configured ? "anchor only" : "offline"}</dd>
             </div>
           </dl>
         </div>
@@ -277,11 +338,20 @@ function App() {
         <div>
           <p className="eyebrow">SAO sync</p>
           <strong>{syncStatus}</strong>
-          <p>
-            {saoConnection.configured
-              ? `Connected target: ${saoConnection.baseUrl}${saoConnection.agentId ? `, agent ${saoConnection.agentId}` : ""}`
-              : "Orion remains local-first until SAO environment variables are configured."}
-          </p>
+          {saoConnection.birthed ? (
+            <p>
+              Owner {saoConnection.ownerUsername ?? "(unknown)"} · provider{" "}
+              <code>{saoConnection.provider}</code> · id <code>{saoConnection.idModel}</code> ·
+              ego <code>{saoConnection.egoModel}</code>
+              {saoConnection.birthedAt ? ` · birthed ${saoConnection.birthedAt}` : ""}
+            </p>
+          ) : (
+            <p>
+              {saoConnection.configured
+                ? `Anchor target: ${saoConnection.baseUrl}${saoConnection.agentId ? `, agent ${saoConnection.agentId}` : ""}`
+                : "Orion remains local-first until SAO environment variables are configured."}
+            </p>
+          )}
           {lastShipReport ? (
             <p>
               Last ship report: {lastShipReport.attempted} attempted, {lastShipReport.acked} acked,{" "}
@@ -298,6 +368,37 @@ function App() {
           </button>
         </div>
       </section>
+
+      {!saoConnection.birthed ? (
+        <section className="enroll-panel" aria-label="Enroll with SAO">
+          <p className="eyebrow">Enroll with SAO</p>
+          <p>
+            Paste the contents of the <code>config.json</code> from your downloaded
+            OrionII bundle here. OrionII will write it to{" "}
+            <code>%APPDATA%\OrionII\config.json</code>, call{" "}
+            <code>GET /api/orion/birth</code>, and re-bootstrap immediately — no
+            restart needed.
+          </p>
+          <textarea
+            aria-label="Bundle config JSON"
+            placeholder='{ "sao_base_url": "http://localhost:3100", "agent_token": "eyJ..." , ... }'
+            value={pastedConfig}
+            onChange={(event) => setPastedConfig(event.target.value)}
+            spellCheck={false}
+            rows={6}
+          />
+          <div className="enroll-actions">
+            <button
+              type="button"
+              onClick={applyPastedConfig}
+              disabled={applyingConfig || pastedConfig.trim().length === 0}
+            >
+              {applyingConfig ? "Applying..." : "Apply config"}
+            </button>
+            {configFeedback ? <span className="enroll-feedback">{configFeedback}</span> : null}
+          </div>
+        </section>
+      ) : null}
 
       <section className="chat-panel" aria-label="Orion chat">
         <div className="transcript">
