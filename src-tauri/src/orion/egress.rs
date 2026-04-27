@@ -20,8 +20,8 @@ use tauri::async_runtime::JoinHandle;
 use uuid::Uuid;
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
-use crate::orion::persistence::{FilePersistence, Persistence};
-use crate::orion::sao::{SaoClientConfig, SaoEgressRecord, SaoEvent, SaoShipper};
+use crate::orion::persistence::{FilePersistence, Persistence, PersistenceError};
+use crate::orion::sao::{SaoClientConfig, SaoEgressRecord, SaoEvent, SaoShipper, ShipReport};
 
 pub fn spawn(
     bus: SharedBus,
@@ -67,27 +67,54 @@ async fn handle_outbound(
     );
 
     // Enqueue under the lock; release before any .await.
-    let (orion_id, mut pending) = {
+    {
         let mut p = persistence.lock().expect("persistence mutex poisoned");
         if let Err(error) = p.enqueue_sao(record) {
             eprintln!("[egress] failed to enqueue SAO event: {error}");
             return;
         }
+    }
+
+    if let Err(error) = ship_pending_with_shipper(persistence, shipper).await {
+        eprintln!("[egress] failed to ship pending SAO egress: {error}");
+    }
+}
+
+/// User-triggered flush for any pending SAO egress backlog. This keeps the
+/// HTTP egress path inside `egress.rs`; commands and services never call
+/// `SaoShipper` directly.
+pub async fn ship_pending_backlog(
+    persistence: &Arc<Mutex<FilePersistence>>,
+    sao_config: Option<SaoClientConfig>,
+) -> Result<ShipReport, PersistenceError> {
+    let shipper = SaoShipper::with_config(sao_config);
+    ship_pending_with_shipper(persistence, &shipper).await
+}
+
+async fn ship_pending_with_shipper(
+    persistence: &Arc<Mutex<FilePersistence>>,
+    shipper: &SaoShipper,
+) -> Result<ShipReport, PersistenceError> {
+    let (orion_id, mut pending) = {
+        let mut p = persistence.lock().expect("persistence mutex poisoned");
         (p.identity().identity.orion_id, p.take_pending_egress())
     };
 
     if pending.is_empty() {
-        return;
+        return Ok(ShipReport {
+            attempted: 0,
+            acked: 0,
+            failed: 0,
+        });
     }
 
     // Ship outside the lock. SaoShipper makes the HTTP call.
-    let _report = shipper.ship_pending(&mut pending, orion_id).await;
+    let report = shipper.ship_pending(&mut pending, orion_id).await;
 
     // Merge results back under the lock.
     let mut p = persistence.lock().expect("persistence mutex poisoned");
-    if let Err(error) = p.merge_egress_results(pending) {
-        eprintln!("[egress] failed to merge ship results: {error}");
-    }
+    p.merge_egress_results(pending)?;
+    Ok(report)
 }
 
 /// Phase 1 sanitization stub. Walks the envelope payload and removes any
@@ -132,13 +159,7 @@ mod tests {
     use serde_json::json;
 
     fn make(payload: serde_json::Value) -> Envelope {
-        Envelope::new(
-            Topic::EgressOutbound,
-            "agent-1",
-            "soul:v1",
-            None,
-            payload,
-        )
+        Envelope::new(Topic::EgressOutbound, "agent-1", "soul:v1", None, payload)
     }
 
     #[test]

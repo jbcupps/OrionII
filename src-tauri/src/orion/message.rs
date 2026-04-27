@@ -21,6 +21,7 @@ pub struct Message {
 
 impl Message {
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn new(
         kind: MessageKind,
         author: Author,

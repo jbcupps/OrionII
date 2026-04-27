@@ -12,6 +12,8 @@ pub mod iggy_supervisor;
 pub mod memory;
 pub mod message;
 pub mod model;
+pub mod nats_supervisor;
+pub mod payloads;
 pub mod persistence;
 pub mod sao;
 pub mod security;

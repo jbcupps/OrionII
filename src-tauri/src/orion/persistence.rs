@@ -17,6 +17,7 @@ use crate::orion::sao::{PolicyOverlay, SaoEgressRecord, SaoEgressState};
 /// that method moved out in Phase 2a so `egress.rs` is the only file that
 /// touches `SaoShipper`.
 pub trait Persistence {
+    #[allow(dead_code)]
     fn record_message(&mut self, message: &Message) -> Result<(), PersistenceError>;
     fn message_count(&self) -> usize;
     fn identity(&self) -> &IdentityState;

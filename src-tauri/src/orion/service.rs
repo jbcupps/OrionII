@@ -10,19 +10,23 @@ use uuid::Uuid;
 use crate::orion::birth::BirthResponse;
 use crate::orion::bootstrap::{BusTransport, OrionBootstrap};
 use crate::orion::bus::{
-    current_soul_ref, BusError, Envelope, IggyBus, InMemoryBus, RecvError, SharedBus, Topic,
+    current_soul_ref, BusError, Envelope, IggyBus, InMemoryBus, NatsJetStreamBus, RecvError,
+    SharedBus, Topic,
 };
-use crate::orion::ego::EgoActionPayload;
 use crate::orion::iggy_auth;
 use crate::orion::iggy_supervisor::IggySupervisor;
-use crate::orion::model::{ModelCallStatus, ModelProviderKind, ModelRouter};
 #[cfg(test)]
 use crate::orion::model::ModelConfig;
+use crate::orion::model::{ModelCallStatus, ModelProviderKind, ModelRouter};
+use crate::orion::nats_supervisor::NatsSupervisor;
+use crate::orion::payloads::EgoActionPayload;
 use crate::orion::persistence::{FilePersistence, Persistence, PersistenceError};
-use crate::orion::sao::{SaoClientConfig, SaoClientError, SaoEgressRecord, SaoShipper, ShipReport};
+use crate::orion::sao::{SaoClientConfig, SaoClientError, SaoPolicyClient, ShipReport};
 use crate::orion::security::{ConstitutionalVerifier, SecurityHealth};
 use crate::orion::skills::{DocumentSkill, OAuthSkillCatalog, SkillAuthorization};
-use crate::orion::{egress, ego, id, superego_local};
+use crate::orion::{ego, egress, id, superego_local};
+
+const UI_EGO_ACTION_EVENT: &str = "orion://ego/action";
 
 #[derive(Debug, Error)]
 pub enum OrionError {
@@ -38,7 +42,7 @@ pub enum OrionError {
 
 /// Acknowledgement returned by the `send_chat_message` Tauri command after
 /// the bus refactor. The actual ego response arrives asynchronously on the
-/// `orion://ego.action` Tauri event.
+/// `orion://ego/action` Tauri event.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatExchange {
@@ -70,6 +74,8 @@ pub struct OrionCore {
     verifier: ConstitutionalVerifier,
     sao_config: Option<SaoClientConfig>,
     birth: Option<BirthResponse>,
+    birth_error: Option<String>,
+    bus_transport: BusTransport,
     /// Held to abort subscriber tasks when this `OrionCore` is dropped
     /// (e.g. on `apply_bundle_config` hot-swap). Subscribers that observe
     /// `RecvError::Closed` will exit cleanly on their own once the bus's
@@ -81,6 +87,10 @@ pub struct OrionCore {
     /// hot-swap or app shutdown.
     #[allow(dead_code)]
     iggy_supervisor: Option<IggySupervisor>,
+    /// Product durable bus sidecar. Held so Drop terminates the local
+    /// nats-server child on hot-swap or app shutdown.
+    #[allow(dead_code)]
+    nats_supervisor: Option<NatsSupervisor>,
 }
 
 impl Default for OrionCore {
@@ -123,36 +133,37 @@ impl OrionCore {
             _ => Arc::new(ModelRouter::new(bootstrap.model.clone())),
         };
 
-        // Bus selection. The `EventBus` trait abstracts both transports;
+        // Bus selection. The `EventBus` trait abstracts every transport;
         // subscribers below don't change shape between them. Any failure
-        // in the iggy path falls back to the in-memory bus with a
+        // in a durable broker path falls back to the in-memory bus with a
         // diagnostic log — the entity stays alive even if the broker
         // doesn't.
-        let orion_id = persistence
-            .lock()
-            .expect("persistence mutex poisoned")
-            .identity()
-            .identity
-            .orion_id;
+        let (orion_id, supervisor_soul_ref) = {
+            let p = persistence.lock().expect("persistence mutex poisoned");
+            let identity = p.identity();
+            (identity.identity.orion_id, current_soul_ref(identity))
+        };
 
-        let (bus, iggy_supervisor): (SharedBus, Option<IggySupervisor>) =
-            match select_bus(&bootstrap.bus_transport, orion_id).await {
-                Ok(pair) => pair,
-                Err(error) => {
-                    eprintln!("[orion-core] iggy bus path failed: {error}; falling back to in-memory");
-                    (InMemoryBus::new(), None)
-                }
-            };
+        let BusSelection {
+            bus,
+            iggy_supervisor,
+            nats_supervisor,
+        } = match select_bus(&bootstrap.bus_transport, orion_id, supervisor_soul_ref).await {
+            Ok(selection) => selection,
+            Err(error) => {
+                eprintln!(
+                    "[orion-core] durable bus path failed: {error}; falling back to in-memory"
+                );
+                BusSelection::in_memory()
+            }
+        };
 
-        let mut handles = Vec::new();
-        handles.push(id::spawn(bus.clone(), persistence.clone(), model.clone()));
-        handles.push(ego::spawn(bus.clone(), model.clone()));
-        handles.push(superego_local::spawn(bus.clone()));
-        handles.push(egress::spawn(
-            bus.clone(),
-            persistence.clone(),
-            bootstrap.sao.clone(),
-        ));
+        let mut handles = vec![
+            id::spawn(bus.clone(), persistence.clone(), model.clone()),
+            ego::spawn(bus.clone(), model.clone()),
+            superego_local::spawn(bus.clone()),
+            egress::spawn(bus.clone(), persistence.clone(), bootstrap.sao.clone()),
+        ];
         if let Some(app) = app {
             handles.push(spawn_ui_emitter(bus.clone(), app));
         }
@@ -166,13 +177,17 @@ impl OrionCore {
             verifier: ConstitutionalVerifier,
             sao_config: bootstrap.sao,
             birth: bootstrap.birth,
+            birth_error: bootstrap.birth_error,
+            bus_transport: bootstrap.bus_transport,
             handles,
             iggy_supervisor,
+            nats_supervisor,
         }
     }
 
     /// Sync wrapper that loads bootstrap + builds in a single block_on.
     /// Prefer `build_async` from inside async code.
+    #[allow(dead_code)]
     pub fn from_bootstrap_blocking() -> Self {
         tauri::async_runtime::block_on(async {
             let bootstrap = OrionBootstrap::load().await;
@@ -196,10 +211,11 @@ impl OrionCore {
         }));
         let bus: SharedBus = InMemoryBus::new();
 
-        let mut handles = Vec::new();
-        handles.push(id::spawn(bus.clone(), persistence.clone(), model.clone()));
-        handles.push(ego::spawn(bus.clone(), model.clone()));
-        handles.push(superego_local::spawn(bus.clone()));
+        let handles = vec![
+            id::spawn(bus.clone(), persistence.clone(), model.clone()),
+            ego::spawn(bus.clone(), model.clone()),
+            superego_local::spawn(bus.clone()),
+        ];
 
         Self {
             bus,
@@ -210,13 +226,20 @@ impl OrionCore {
             verifier: ConstitutionalVerifier,
             sao_config: None,
             birth: None,
+            birth_error: None,
+            bus_transport: BusTransport::InMemory,
             handles,
             iggy_supervisor: None,
+            nats_supervisor: None,
         }
     }
 
     pub fn birth(&self) -> Option<&BirthResponse> {
         self.birth.as_ref()
+    }
+
+    pub fn birth_error(&self) -> Option<&str> {
+        self.birth_error.as_deref()
     }
 
     /// Publish a `MentorInput` envelope and return immediately. The Ego
@@ -267,8 +290,8 @@ impl OrionCore {
     }
 
     pub async fn apply_sao_policy_refresh(&self, rules: Vec<String>) -> Result<u64, OrionError> {
-        let shipper = SaoShipper::with_config(self.sao_config.clone());
-        let policy = match shipper.fetch_policy().await {
+        let policy_client = SaoPolicyClient::with_config(self.sao_config.clone());
+        let policy = match policy_client.fetch_policy().await {
             Ok(policy) => policy,
             Err(SaoClientError::NotConfigured) => {
                 let p = self.persistence.lock().expect("persistence mutex poisoned");
@@ -291,26 +314,15 @@ impl OrionCore {
     /// ship / merge dance as `egress::handle_outbound`, just exposed as a
     /// command so the UI can flush the queue manually.
     pub async fn ship_sao_egress(&self) -> Result<ShipReport, OrionError> {
-        let (orion_id, mut pending): (Uuid, Vec<SaoEgressRecord>) = {
-            let mut p = self.persistence.lock().expect("persistence mutex poisoned");
-            (p.identity().identity.orion_id, p.take_pending_egress())
-        };
-        if pending.is_empty() {
-            return Ok(ShipReport {
-                attempted: 0,
-                acked: 0,
-                failed: 0,
-            });
-        }
-        let shipper = SaoShipper::with_config(self.sao_config.clone());
-        let report = shipper.ship_pending(&mut pending, orion_id).await;
-        let mut p = self.persistence.lock().expect("persistence mutex poisoned");
-        p.merge_egress_results(pending)?;
-        Ok(report)
+        Ok(egress::ship_pending_backlog(&self.persistence, self.sao_config.clone()).await?)
     }
 
     pub fn sao_config(&self) -> Option<&SaoClientConfig> {
         self.sao_config.as_ref()
+    }
+
+    pub fn bus_transport_label(&self) -> &'static str {
+        self.bus_transport.as_label()
     }
 
     /// Returns the iggy-server endpoint when running on the
@@ -357,15 +369,58 @@ struct UiEgoActionEvent {
     response_text: String,
 }
 
-/// Resolve which bus transport to construct. Returns the bus + (when
-/// applicable) the iggy supervisor handle. Errors here are non-fatal: the
-/// caller falls back to in-memory and continues.
+struct BusSelection {
+    bus: SharedBus,
+    iggy_supervisor: Option<IggySupervisor>,
+    nats_supervisor: Option<NatsSupervisor>,
+}
+
+impl BusSelection {
+    fn in_memory() -> Self {
+        Self {
+            bus: InMemoryBus::new(),
+            iggy_supervisor: None,
+            nats_supervisor: None,
+        }
+    }
+}
+
+/// Resolve which bus transport to construct. Returns the bus + any owned
+/// sidecar supervisor handle. Errors here are non-fatal: the caller falls
+/// back to in-memory and continues.
 async fn select_bus(
     transport: &BusTransport,
     orion_id: Uuid,
-) -> Result<(SharedBus, Option<IggySupervisor>), String> {
+    supervisor_soul_ref: String,
+) -> Result<BusSelection, String> {
     match transport {
-        BusTransport::InMemory => Ok((InMemoryBus::new(), None)),
+        BusTransport::InMemory => Ok(BusSelection::in_memory()),
+
+        BusTransport::NatsJetStream { port } => {
+            let supervisor_bus: SharedBus = InMemoryBus::new();
+            let supervisor = NatsSupervisor::start(*port, supervisor_bus, supervisor_soul_ref)
+                .await
+                .map_err(|e| format!("nats supervisor start: {e}"))?;
+            let nats_bus = NatsJetStreamBus::connect(supervisor.endpoint(), orion_id)
+                .await
+                .map_err(|e| format!("nats connect: {e}"))?;
+            Ok(BusSelection {
+                bus: nats_bus as SharedBus,
+                iggy_supervisor: None,
+                nats_supervisor: Some(supervisor),
+            })
+        }
+
+        BusTransport::ExternalNatsJetStream { endpoint } => {
+            let nats_bus = NatsJetStreamBus::connect(endpoint, orion_id)
+                .await
+                .map_err(|e| format!("external nats connect: {e}"))?;
+            Ok(BusSelection {
+                bus: nats_bus as SharedBus,
+                iggy_supervisor: None,
+                nats_supervisor: None,
+            })
+        }
 
         BusTransport::BundledIggy { port } => {
             // The supervisor needs a SharedBus to publish broker-unstable
@@ -376,7 +431,7 @@ async fn select_bus(
             // future Phase 2.1 will plumb the real bus through to the
             // supervisor after IggyBus is built.
             let supervisor_bus: SharedBus = InMemoryBus::new();
-            let supervisor = IggySupervisor::start(*port, supervisor_bus)
+            let supervisor = IggySupervisor::start(*port, supervisor_bus, supervisor_soul_ref)
                 .await
                 .map_err(|e| format!("supervisor start: {e}"))?;
             let endpoint_no_scheme = supervisor
@@ -388,7 +443,11 @@ async fn select_bus(
             let iggy_bus = IggyBus::connect(&endpoint_no_scheme, &user, &pass, orion_id)
                 .await
                 .map_err(|e| format!("iggy connect: {e}"))?;
-            Ok((iggy_bus as SharedBus, Some(supervisor)))
+            Ok(BusSelection {
+                bus: iggy_bus as SharedBus,
+                iggy_supervisor: Some(supervisor),
+                nats_supervisor: None,
+            })
         }
 
         BusTransport::ExternalIggy { endpoint, pat } => {
@@ -397,7 +456,11 @@ async fn select_bus(
             let iggy_bus = IggyBus::connect(&endpoint_no_scheme, &user, &pass, orion_id)
                 .await
                 .map_err(|e| format!("external iggy connect: {e}"))?;
-            Ok((iggy_bus as SharedBus, None))
+            Ok(BusSelection {
+                bus: iggy_bus as SharedBus,
+                iggy_supervisor: None,
+                nats_supervisor: None,
+            })
         }
     }
 }
@@ -419,7 +482,9 @@ async fn load_or_provision_creds(endpoint: &str) -> iggy_auth::IggyCredentials {
     let path = match iggy_auth::pat_store_path() {
         Ok(p) => p,
         Err(error) => {
-            eprintln!("[orion-core] could not resolve PAT store path: {error}; using bootstrap creds");
+            eprintln!(
+                "[orion-core] could not resolve PAT store path: {error}; using bootstrap creds"
+            );
             return iggy_auth::IggyCredentials {
                 endpoint: endpoint.to_string(),
                 pat: "iggy:iggy".to_string(),
@@ -465,7 +530,7 @@ fn spawn_ui_emitter(bus: SharedBus, app: AppHandle) -> JoinHandle<()> {
                         user_query: action.user_query,
                         response_text: action.response_text,
                     };
-                    if let Err(error) = app.emit("orion://ego.action", &event) {
+                    if let Err(error) = app.emit(UI_EGO_ACTION_EVENT, &event) {
                         eprintln!("[ui-emitter] failed to emit Tauri event: {error}");
                     }
                 }
@@ -484,6 +549,13 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    #[test]
+    fn ui_ego_action_event_name_uses_tauri_safe_chars() {
+        assert!(UI_EGO_ACTION_EVENT
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '/' | ':' | '_')));
+    }
+
     /// End-to-end smoke test: publishing a `MentorInput` results in an
     /// `EgoAction` arriving on the bus with a non-empty response text and
     /// a non-empty soul_ref. The deterministic model provider keeps this
@@ -499,6 +571,7 @@ mod tests {
         let core = OrionCore::with_persistence(persistence);
 
         let mut ego_rx = core.bus.subscribe(Topic::EgoAction);
+        let mut egress_rx = core.bus.subscribe(Topic::EgressOutbound);
 
         let ack = core
             .send_chat_message("Help me plan the day".to_string())
@@ -517,6 +590,17 @@ mod tests {
 
         let payload: EgoActionPayload = serde_json::from_value(env.payload).unwrap();
         assert!(!payload.response_text.is_empty());
+
+        let outbound = timeout(Duration::from_secs(5), egress_rx.recv())
+            .await
+            .expect("EgressOutbound did not arrive within 5s")
+            .expect("recv error");
+
+        assert_eq!(outbound.topic, Topic::EgressOutbound);
+        assert_eq!(outbound.correlation_id, Some(ack.correlation_id));
+        assert_eq!(outbound.soul_ref, env.soul_ref);
+        assert_eq!(outbound.payload["action"], Topic::EgoAction.as_str());
+        assert_eq!(outbound.payload["sourceTopic"], Topic::EgoAction.as_str());
 
         drop(core);
         let _ = std::fs::remove_dir_all(dir);

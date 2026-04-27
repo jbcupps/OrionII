@@ -15,18 +15,10 @@
 //! the entity — lives in SAO and arrives via `Topic::GovernanceInbound`.
 //! This module is intentionally only the local stub.
 
-use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SuperegoLocalEvaluation {
-    pub accepted: bool,
-    pub soul_ref: String,
-    pub note: String,
-}
+use crate::orion::payloads::SuperegoLocalEvaluation;
 
 pub fn spawn(bus: SharedBus) -> JoinHandle<()> {
     let mut rx = bus.subscribe(Topic::EgoAction);

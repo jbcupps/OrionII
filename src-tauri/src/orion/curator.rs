@@ -1,13 +1,42 @@
 use crate::orion::ethics::{EthicsOverlay, EthicsScaffoldInput};
-use crate::orion::id::{IdRuntime, IdSignal};
 use crate::orion::identity::IdentityState;
 use crate::orion::model::ModelProvider;
+use crate::orion::payloads::IdSignal;
 use crate::orion::skills::DocumentSkill;
 
 #[derive(Default)]
 pub struct CuratorRuntime {
     id: IdRuntime,
     documents: DocumentSkill,
+}
+
+#[derive(Default)]
+struct IdRuntime;
+
+impl IdRuntime {
+    async fn consult(
+        &self,
+        identity: &IdentityState,
+        query: &str,
+        context: &str,
+        model: &dyn ModelProvider,
+    ) -> IdSignal {
+        let personality_signal = model
+            .consult_id(identity, query, context)
+            .await
+            .unwrap_or_else(|error| {
+                format!(
+                    "{} remains {}. Local Id model degraded: {}.",
+                    identity.personality.name, identity.personality.stance, error
+                )
+            });
+
+        IdSignal {
+            identity_version: identity.version,
+            personality_signal,
+            drives: identity.drives.clone(),
+        }
+    }
 }
 
 /// Raw curated payload — the data shape the bus pipeline carries on
@@ -26,16 +55,14 @@ impl CuratorRuntime {
         user_query: &str,
         identity: &IdentityState,
         document_context: &str,
-        model: &(dyn ModelProvider),
+        model: &dyn ModelProvider,
     ) -> CuratedRaw {
         let id_signal = self
             .id
             .consult(identity, user_query, document_context, model)
             .await;
-        let ethics = EthicsOverlay::scaffold(
-            EthicsScaffoldInput { user_query },
-            &identity.ethics_lean,
-        );
+        let ethics =
+            EthicsOverlay::scaffold(EthicsScaffoldInput { user_query }, &identity.ethics_lean);
         let context_summary = if document_context.is_empty() {
             "No matching local document context.".to_string()
         } else {

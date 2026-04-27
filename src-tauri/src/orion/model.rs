@@ -188,6 +188,7 @@ impl ModelRouter {
         &self.config
     }
 
+    #[allow(dead_code)]
     pub fn clear_statuses(&self) {
         if let Ok(mut statuses) = self.statuses.lock() {
             statuses.clear();
@@ -213,7 +214,10 @@ impl ModelRouter {
         query: &str,
         context: &str,
     ) -> ModelResult<String> {
-        let text = self.deterministic.consult_id(identity, query, context).await?;
+        let text = self
+            .deterministic
+            .consult_id(identity, query, context)
+            .await?;
         self.record(ModelCallStatus {
             role: ModelRole::Id,
             provider: ModelProviderKind::Deterministic,
@@ -229,7 +233,10 @@ impl ModelRouter {
         prompt: &ModelPrompt,
         ethics: &EthicsOverlay,
     ) -> ModelResult<String> {
-        let text = self.deterministic.generate_ego_response(prompt, ethics).await?;
+        let text = self
+            .deterministic
+            .generate_ego_response(prompt, ethics)
+            .await?;
         self.record(ModelCallStatus {
             role: ModelRole::Ego,
             provider: ModelProviderKind::Deterministic,
@@ -638,8 +645,8 @@ impl SaoProxyProvider {
             )));
         }
 
-        let parsed: SaoProxyResponse = serde_json::from_str(&text)
-            .map_err(|e| ModelError::InvalidResponse(e.to_string()))?;
+        let parsed: SaoProxyResponse =
+            serde_json::from_str(&text).map_err(|e| ModelError::InvalidResponse(e.to_string()))?;
         if let Some(err) = parsed.error {
             return Err(ModelError::RuntimeUnavailable(err));
         }

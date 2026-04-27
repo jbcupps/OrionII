@@ -6,12 +6,13 @@
 //! and should be rejected in code review (see ADR-001 and CLAUDE.md).
 //!
 //! The trait exists so the underlying transport can be swapped from the
-//! in-process default (`InMemoryBus`, tokio broadcast) to Apache Iggy
-//! without touching callers. New code MUST NOT depend on the concrete bus
-//! type — depend on `SharedBus` and the `EventBus` trait instead.
+//! in-process default (`InMemoryBus`, tokio broadcast) to a durable local
+//! broker (`NatsJetStreamBus`, or the experimental `IggyBus`) without
+//! touching callers. New code MUST NOT depend on the concrete bus type —
+//! depend on `SharedBus` and the `EventBus` trait instead.
 //!
-//! `publish` is async because the future Iggy backend's publish is a network
-//! call. `subscribe` stays sync but returns a `BusReceiver` wrapper whose
+//! `publish` is async because durable broker backends publish over a local
+//! network connection. `subscribe` stays sync but returns a `BusReceiver` wrapper whose
 //! `recv` is async on every backend. Subscribers always look like:
 //!
 //! ```ignore
@@ -40,9 +41,11 @@ use crate::orion::identity::IdentityState;
 
 pub mod iggy;
 pub mod inmem;
+pub mod nats;
 
 pub use iggy::IggyBus;
 pub use inmem::InMemoryBus;
+pub use nats::NatsJetStreamBus;
 
 /// Canonical topic set for the entity-internal bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -146,13 +149,13 @@ impl From<broadcast::error::RecvError> for RecvError {
 }
 
 /// Subscriber-side handle. Wraps either a tokio broadcast receiver from
-/// `InMemoryBus`, or a per-topic broadcast receiver fed by `IggyBus`'s
-/// polling task. Subscribers don't need to know which.
+/// `InMemoryBus`, or a per-topic broadcast receiver fed by the durable
+/// broker polling task. Subscribers don't need to know which.
 ///
 /// Both variants are tokio broadcast receivers — what differs is who feeds
 /// them. The `InMemory` variant is fed by the publisher directly; the
-/// `Iggy` variant is fed by `IggyBus`'s per-topic polling task pulling
-/// from the iggy server.
+/// broker variants are fed by per-topic polling tasks pulling from the
+/// local sidecar.
 pub struct BusReceiver {
     inner: BusReceiverInner,
 }
@@ -160,6 +163,7 @@ pub struct BusReceiver {
 enum BusReceiverInner {
     InMemory(broadcast::Receiver<Envelope>),
     Iggy(broadcast::Receiver<Envelope>),
+    Nats(broadcast::Receiver<Envelope>),
 }
 
 impl BusReceiver {
@@ -175,10 +179,17 @@ impl BusReceiver {
         }
     }
 
+    pub fn from_nats(rx: broadcast::Receiver<Envelope>) -> Self {
+        Self {
+            inner: BusReceiverInner::Nats(rx),
+        }
+    }
+
     pub async fn recv(&mut self) -> Result<Envelope, RecvError> {
         match &mut self.inner {
             BusReceiverInner::InMemory(rx) => rx.recv().await.map_err(RecvError::from),
             BusReceiverInner::Iggy(rx) => rx.recv().await.map_err(RecvError::from),
+            BusReceiverInner::Nats(rx) => rx.recv().await.map_err(RecvError::from),
         }
     }
 }

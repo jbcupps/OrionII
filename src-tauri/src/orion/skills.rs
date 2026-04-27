@@ -19,6 +19,7 @@ impl SkillAuthorization {
         }
     }
 
+    #[allow(dead_code)]
     pub fn local_os(skill_name: impl Into<String>, scopes: Vec<String>) -> Self {
         Self {
             skill_name: skill_name.into(),
@@ -68,10 +69,12 @@ impl DocumentSkill {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct OutlookSkill;
 
 impl OutlookSkill {
+    #[allow(dead_code)]
     pub fn authorization(&self) -> SkillAuthorization {
         SkillAuthorization::local_os(
             "outlook",
@@ -97,6 +100,7 @@ impl OAuthSkillCatalog {
         self.skills.push(skill);
     }
 
+    #[allow(dead_code)]
     pub fn scopes_for(&self, skill_name: &str) -> Option<&[String]> {
         self.skills
             .iter()

@@ -1,6 +1,6 @@
 [package]
 name = "orionii"
-version = "0.1.0"
+version = "0.1.1"
 description = "OrionII M0 skeleton"
 authors = ["OrionII Contributors"]
 edition = "2021"
@@ -14,8 +14,10 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 async-trait = "0.1"
+async-nats = "0.47.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 dashmap = "6"
+futures-util = "0.3"
 iggy = "0.10"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "http2"] }
 serde = { version = "1.0.228", features = ["derive"] }

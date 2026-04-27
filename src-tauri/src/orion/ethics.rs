@@ -22,12 +22,15 @@ pub struct EthicsScaffoldInput<'a> {
 }
 
 impl EthicsOverlay {
-    pub fn scaffold(_input: EthicsScaffoldInput<'_>, lean: &EthicsLean) -> Self {
-        let guidance = vec![
+    pub fn scaffold(input: EthicsScaffoldInput<'_>, lean: &EthicsLean) -> Self {
+        let mut guidance = vec![
             "Respect the worker's agency and local ownership.".to_string(),
             "Prefer truthful, reversible, and inspectable actions.".to_string(),
             "Escalate uncertainty instead of pretending to know.".to_string(),
         ];
+        if input.user_query.trim().is_empty() {
+            guidance.push("Ask for the worker's concrete request before acting.".to_string());
+        }
 
         Self {
             deontological: lean.deontological,

@@ -63,8 +63,6 @@ pub enum IggyBusError {
     Iggy(String),
     #[error("could not parse identifier: {0}")]
     Identifier(String),
-    #[error("transport error: {0}")]
-    Transport(String),
 }
 
 impl From<IggyError> for IggyBusError {
@@ -182,8 +180,16 @@ impl EventBus for IggyBus {
 
 async fn ensure_stream(client: &Arc<IggyClient>, name: &str) -> Result<(), IggyBusError> {
     let id = Identifier::named(name).map_err(|e| IggyBusError::Identifier(e.to_string()))?;
-    if client.get_stream(&id).await.map_err(IggyBusError::from)?.is_none() {
-        client.create_stream(name).await.map_err(IggyBusError::from)?;
+    if client
+        .get_stream(&id)
+        .await
+        .map_err(IggyBusError::from)?
+        .is_none()
+    {
+        client
+            .create_stream(name)
+            .await
+            .map_err(IggyBusError::from)?;
     }
     Ok(())
 }

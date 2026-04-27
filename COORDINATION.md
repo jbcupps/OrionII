@@ -24,15 +24,23 @@ Before declaring the integration green, run the OrionII checks in
   logged).
 - **In-app enrollment**: a yellow **Enroll with SAO** panel is visible until birth succeeds.
   Pasting the bundle JSON writes it to `%APPDATA%\OrionII\config.json` and hot-swaps the
-  running OrionCore behind the Tauri Mutex — no restart needed.
+  running OrionCore behind the Tauri Mutex — no restart needed. This remains a support/manual
+  fallback; the SAO-downloaded ZIP now includes a double-click launcher that writes the config
+  automatically for non-technical users.
 - **Model router**: `Deterministic`, `OllamaWithFallback`, `SaoProxyWithFallback`. Bundle
   flow picks `SaoProxyWithFallback` so all real model calls flow through SAO and hit
   whichever provider/model the admin configured. Deterministic stub still serves when SAO is
   unreachable.
 - **Status surface**: three explicit modes — `birthed`, `anchor only`, `offline` — surfaced
   in the desktop UI status card with owner / provider / id-model / ego-model / birthed-at.
-- **Egress observability**: every batch carries `clientVersion` (OrionII semver).
-- **Iggy and SurrealDB** remain target architecture items, not in MVP.
+- **Egress observability**: every batch carries `clientVersion` (OrionII semver), and chat
+  flow publishes a correlated `egress.outbound` audit envelope after `ego.action`.
+- **Durable bus transport**: OrionII can run its entity-internal bus on `in_memory`,
+  `nats_jetstream`, `external_nats_jetstream`, or the experimental Iggy adapters via
+  `config.json` `bus_transport`. Release MSI builds run `scripts/build-installer.ps1` to
+  prepare/package the `nats-server` JetStream sidecar by default, and SAO remains outside
+  this bus.
+- **SurrealDB** remains a target architecture item, not in MVP.
 - **Local SAO bootstrap** is a Compose/dev command, not the production Azure installer path.
 
 ## Identity story

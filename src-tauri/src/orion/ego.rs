@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
 use crate::orion::ethics::{EthicsOverlay, EthicsOverlaySource};
-use crate::orion::id::IdReactionPayload;
 use crate::orion::model::{ModelPrompt, ModelProvider, ModelRouter};
+use crate::orion::payloads::{EgoActionPayload, IdReactionPayload};
 
 #[derive(Default)]
 pub struct EgoRuntime;
@@ -19,7 +18,7 @@ impl EgoRuntime {
         &self,
         prompt: &ModelPrompt,
         ethics: &EthicsOverlay,
-        model: &(dyn ModelProvider),
+        model: &dyn ModelProvider,
     ) -> String {
         model
             .generate_ego_response(prompt, ethics)
@@ -31,17 +30,6 @@ impl EgoRuntime {
                 )
             })
     }
-}
-
-/// The shape an Ego subscriber publishes onto `Topic::EgoAction`. The UI
-/// emitter forwards this to the React app via a Tauri event; the local
-/// Superego subscriber inspects it for governance evaluation; the egress
-/// subscriber sanitizes and ships it to SAO.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EgoActionPayload {
-    pub user_query: String,
-    pub response_text: String,
 }
 
 /// Spawn the Ego subscriber task.
@@ -95,12 +83,27 @@ async fn handle_id_reaction(bus: &SharedBus, model: &Arc<ModelRouter>, env: Enve
 
     let envelope = Envelope::new(
         Topic::EgoAction,
-        agent_id,
-        soul_ref,
+        agent_id.clone(),
+        soul_ref.clone(),
         correlation_id,
         value,
     );
     if let Err(error) = bus.publish(envelope).await {
         eprintln!("[ego-subscriber] failed to publish EgoAction: {error}");
+    }
+
+    let outbound = Envelope::new(
+        Topic::EgressOutbound,
+        agent_id,
+        soul_ref,
+        correlation_id,
+        serde_json::json!({
+            "action": Topic::EgoAction.as_str(),
+            "sourceTopic": Topic::EgoAction.as_str(),
+            "responseBytes": action.response_text.len(),
+        }),
+    );
+    if let Err(error) = bus.publish(outbound).await {
+        eprintln!("[ego-subscriber] failed to publish EgressOutbound audit: {error}");
     }
 }

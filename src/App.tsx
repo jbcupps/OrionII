@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 // After the EventBus refactor (see OrionII/docs/ADR-001), the chat surface
 // no longer awaits a `ChatExchange` return value from `send_chat_message`.
 // The command returns immediately with a correlation id; the assistant
-// reply arrives asynchronously on the `orion://ego.action` Tauri event,
+// reply arrives asynchronously on the `orion://ego/action` Tauri event,
 // emitted by the UI emitter subscriber on `Topic::EgoAction`.
 
 type ChatAck = {
@@ -69,6 +69,8 @@ type SaoConnectionStatus = {
   egoModel: string | null;
   birthedAt: string | null;
   policyVersion: number | null;
+  birthError: string | null;
+  busTransport: string;
 };
 
 const EMPTY_STATUS: CompanionStatusReport = {
@@ -84,6 +86,8 @@ const EMPTY_STATUS: CompanionStatusReport = {
   },
   modelStatus: []
 };
+
+const ORION_EGO_ACTION_EVENT = "orion://ego/action";
 
 function App() {
   const [draft, setDraft] = useState("");
@@ -105,14 +109,12 @@ function App() {
     idModel: null,
     egoModel: null,
     birthedAt: null,
-    policyVersion: null
+    policyVersion: null,
+    birthError: null,
+    busTransport: "in_memory"
   });
   const [syncStatus, setSyncStatus] = useState("SAO sync not checked");
   const [lastShipReport, setLastShipReport] = useState<ShipReport | null>(null);
-  const [pastedConfig, setPastedConfig] = useState("");
-  const [applyingConfig, setApplyingConfig] = useState(false);
-  const [configFeedback, setConfigFeedback] = useState<string | null>(null);
-
   const canSend = useMemo(() => draft.trim().length > 0 && !isSending, [draft, isSending]);
 
   useEffect(() => {
@@ -125,11 +127,11 @@ function App() {
           );
         } else if (connection.configured) {
           setSyncStatus(
-            `Anchor loaded at ${connection.baseUrl}; SAO unreachable — running on bundle defaults`
+            `Enrollment anchor loaded at ${connection.baseUrl}; ${connection.birthError ? "SAO rejected it" : "SAO is unreachable"}`
           );
         } else {
           setSyncStatus(
-            "Offline local mode; drop config.json into %APPDATA%\\OrionII or set SAO_BASE_URL + SAO_DEV_BEARER_TOKEN"
+            "Offline local mode; install OrionII from a SAO agent bundle to enroll"
           );
         }
       })
@@ -142,10 +144,10 @@ function App() {
       });
   }, []);
 
-  // Subscribe to `orion://ego.action` once at mount. This is the architectural
+  // Subscribe to `orion://ego/action` once at mount. This is the architectural
   // inversion: chat output flows through the bus, not through a command return.
   useEffect(() => {
-    const unlistenPromise = listen<EgoActionEvent>("orion://ego.action", (event) => {
+    const unlistenPromise = listen<EgoActionEvent>(ORION_EGO_ACTION_EVENT, (event) => {
       const payload = event.payload;
       setHistory((current) => [
         ...current,
@@ -188,7 +190,7 @@ function App() {
     try {
       const ack = await invoke<ChatAck>("send_chat_message", { text });
       // Append the user message immediately. The orion reply arrives later
-      // via the `orion://ego.action` event listener registered above.
+      // via the `orion://ego/action` event listener registered above.
       setHistory((current) => [
         ...current,
         {
@@ -224,40 +226,6 @@ function App() {
       setSyncStatus("Policy refresh failed");
     } finally {
       setIsSyncing(false);
-    }
-  }
-
-  async function applyPastedConfig() {
-    setError(null);
-    setConfigFeedback(null);
-    if (!pastedConfig.trim()) {
-      setConfigFeedback("Paste the bundle config.json above first.");
-      return;
-    }
-    setApplyingConfig(true);
-    try {
-      const result = await invoke<{
-        writtenTo: string;
-        status: SaoConnectionStatus;
-      }>("apply_bundle_config", { json: pastedConfig });
-      setSaoConnection(result.status);
-      setPastedConfig("");
-      if (result.status.birthed) {
-        setSyncStatus(
-          `Birthed as ${result.status.agentName ?? "(unnamed)"} via ${result.status.provider ?? "(no provider)"} (policy v${result.status.policyVersion ?? 0})`
-        );
-      } else if (result.status.configured) {
-        setSyncStatus(
-          `Anchor saved at ${result.writtenTo}; SAO unreachable — running on bundle defaults`
-        );
-      }
-      setConfigFeedback(`Saved to ${result.writtenTo}.`);
-    } catch (cause) {
-      setConfigFeedback(
-        `Apply failed: ${cause instanceof Error ? cause.message : String(cause)}`
-      );
-    } finally {
-      setApplyingConfig(false);
     }
   }
 
@@ -327,6 +295,10 @@ function App() {
               <dt>SAO</dt>
               <dd>{saoConnection.birthed ? "birthed" : saoConnection.configured ? "anchor only" : "offline"}</dd>
             </div>
+            <div>
+              <dt>Bus</dt>
+              <dd>{saoConnection.busTransport}</dd>
+            </div>
           </dl>
         </div>
       </section>
@@ -368,32 +340,30 @@ function App() {
 
       {!saoConnection.birthed ? (
         <section className="enroll-panel" aria-label="Enroll with SAO">
-          <p className="eyebrow">Enroll with SAO</p>
-          <p>
-            Paste the contents of the <code>config.json</code> from your downloaded
-            OrionII bundle here. OrionII will write it to{" "}
-            <code>%APPDATA%\OrionII\config.json</code>, call{" "}
-            <code>GET /api/orion/birth</code>, and re-bootstrap immediately — no
-            restart needed.
-          </p>
-          <textarea
-            aria-label="Bundle config JSON"
-            placeholder='{ "sao_base_url": "http://localhost:3100", "agent_token": "eyJ..." , ... }'
-            value={pastedConfig}
-            onChange={(event) => setPastedConfig(event.target.value)}
-            spellCheck={false}
-            rows={6}
-          />
-          <div className="enroll-actions">
-            <button
-              type="button"
-              onClick={applyPastedConfig}
-              disabled={applyingConfig || pastedConfig.trim().length === 0}
-            >
-              {applyingConfig ? "Applying..." : "Apply config"}
-            </button>
-            {configFeedback ? <span className="enroll-feedback">{configFeedback}</span> : null}
-          </div>
+          <p className="eyebrow">SAO enrollment</p>
+          <h2>No JSON paste required</h2>
+          {saoConnection.configured ? (
+            <p>
+              OrionII found an enrollment anchor for agent{" "}
+              <code>{saoConnection.agentId ?? "(unknown)"}</code>, but SAO did not
+              birth it. Download the agent bundle again from SAO and run{" "}
+              <code>Install-OrionII.cmd</code>. If you accidentally run{" "}
+              <code>OrionII-Setup.msi</code> directly from the extracted bundle,
+              the installer will also pick up the sibling <code>config.json</code>.
+            </p>
+          ) : (
+            <p>
+              Create or download an agent in SAO, extract the bundle, and
+              double-click <code>Install-OrionII.cmd</code>. The installer copies
+              the enrollment config automatically and OrionII will use the SAO
+              container it came from.
+            </p>
+          )}
+          {saoConnection.birthError ? (
+            <p className="enroll-feedback">
+              SAO response: <code>{saoConnection.birthError}</code>
+            </p>
+          ) : null}
         </section>
       ) : null}
 

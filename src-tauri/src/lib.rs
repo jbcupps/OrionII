@@ -19,6 +19,8 @@ struct SaoConnectionStatus {
     ego_model: Option<String>,
     birthed_at: Option<String>,
     policy_version: Option<u64>,
+    birth_error: Option<String>,
+    bus_transport: String,
 }
 
 /// Tauri command bodies are intentionally thin adapters: each one publishes
@@ -99,13 +101,10 @@ async fn rotate_iggy_token(
     let endpoint = match core.iggy_endpoint() {
         Some(e) => e,
         None => {
-            return Err(
-                "Iggy is not active on this entity (BusTransport is InMemory)".to_string(),
-            )
+            return Err("Iggy is not active on this entity (BusTransport is InMemory)".to_string())
         }
     };
-    let path = orion::iggy_auth::pat_store_path()
-        .map_err(|e| format!("PAT store path: {e}"))?;
+    let path = orion::iggy_auth::pat_store_path().map_err(|e| format!("PAT store path: {e}"))?;
     let creds = orion::iggy_auth::provision_first_run(&endpoint)
         .await
         .map_err(|e| format!("PAT provision: {e}"))?;
@@ -137,6 +136,8 @@ async fn sao_connection_status(
         ego_model: birth.and_then(|b| b.agent.default_ego_model.clone()),
         birthed_at: birth.map(|b| b.birthed_at.to_rfc3339()),
         policy_version: birth.map(|b| b.policy.version),
+        birth_error: core.birth_error().map(str::to_string),
+        bus_transport: core.bus_transport_label().to_string(),
     })
 }
 
@@ -160,8 +161,8 @@ async fn apply_bundle_config(
     if trimmed.is_empty() {
         return Err("Pasted config is empty".to_string());
     }
-    let parsed: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|e| format!("Pasted text is not valid JSON: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| format!("Pasted text is not valid JSON: {e}"))?;
     if !parsed.is_object() {
         return Err("Pasted JSON must be an object".to_string());
     }
@@ -209,6 +210,8 @@ async fn apply_bundle_config(
             ego_model: birth.and_then(|b| b.agent.default_ego_model.clone()),
             birthed_at: birth.map(|b| b.birthed_at.to_rfc3339()),
             policy_version: birth.map(|b| b.policy.version),
+            birth_error: core.birth_error().map(str::to_string),
+            bus_transport: core.bus_transport_label().to_string(),
         }
     };
     Ok(ApplyConfigResult {

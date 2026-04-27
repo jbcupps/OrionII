@@ -17,6 +17,7 @@ pub struct MemoryRecord {
 }
 
 impl MemoryRecord {
+    #[allow(dead_code)]
     pub fn from_message(message: &Message) -> Option<Self> {
         let content = match &message.payload {
             Payload::UserInput { text } | Payload::ChatOutput { text } => text.clone(),

@@ -1,62 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
 
 use crate::orion::bus::{current_soul_ref, Envelope, RecvError, SharedBus, Topic};
 use crate::orion::curator::CuratorRuntime;
-use crate::orion::identity::IdentityState;
-use crate::orion::model::{ModelProvider, ModelRouter};
+use crate::orion::model::ModelRouter;
+use crate::orion::payloads::IdReactionPayload;
 use crate::orion::persistence::{FilePersistence, Persistence};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdSignal {
-    pub identity_version: u64,
-    pub personality_signal: String,
-    pub drives: Vec<String>,
-}
-
-#[derive(Default)]
-pub struct IdRuntime;
-
-impl IdRuntime {
-    pub async fn consult(
-        &self,
-        identity: &IdentityState,
-        query: &str,
-        context: &str,
-        model: &(dyn ModelProvider),
-    ) -> IdSignal {
-        let personality_signal = model
-            .consult_id(identity, query, context)
-            .await
-            .unwrap_or_else(|error| {
-                format!(
-                    "{} remains {}. Local Id model degraded: {}.",
-                    identity.personality.name, identity.personality.stance, error
-                )
-            });
-
-        IdSignal {
-            identity_version: identity.version,
-            personality_signal,
-            drives: identity.drives.clone(),
-        }
-    }
-}
-
-/// The shape an Id subscriber publishes onto `Topic::IdReaction`. The Ego
-/// subscriber deserializes this and turns it into a model prompt.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdReactionPayload {
-    pub user_query: String,
-    pub system_prompt: String,
-    pub context_summary: String,
-    pub id_signal: IdSignal,
-    pub ethics_guidance: Vec<String>,
-}
 
 /// Spawn the Id subscriber task.
 ///
@@ -126,13 +76,7 @@ async fn handle_mentor_input(
     };
 
     let value = serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null);
-    let reaction = Envelope::new(
-        Topic::IdReaction,
-        agent_id,
-        soul_ref,
-        correlation_id,
-        value,
-    );
+    let reaction = Envelope::new(Topic::IdReaction, agent_id, soul_ref, correlation_id, value);
     if let Err(error) = bus.publish(reaction).await {
         eprintln!("[id-subscriber] failed to publish IdReaction: {error}");
     }

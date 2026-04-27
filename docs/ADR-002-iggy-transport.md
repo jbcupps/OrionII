@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted. 2026-04-27.
+Superseded by [ADR-003: NATS JetStream as the packaged durable EventBus transport](ADR-003-nats-jetstream-transport.md). 2026-04-27.
+
+ADR-002 remains as historical record for the Iggy adapter. The code path is still present for experiments, but it is not the default product packaging path because official Apache Iggy Windows server convenience binaries are not available yet.
 
 ## Context
 
@@ -35,7 +37,9 @@ Any failure on the iggy path falls back to `InMemoryBus` with a diagnostic log. 
 `orion::iggy_supervisor::IggySupervisor` owns the iggy-server child process. Responsibilities:
 
 - Locate the binary in this order: `ORIONII_IGGY_SERVER` env var → `iggy-server*` next to the OrionII executable (Tauri externalBin layout) → `iggy-server` on `PATH`.
-- Spawn with `IGGY_SYSTEM_PATH={config_dir}/OrionII/iggy/` and `IGGY_TCP_ADDRESS=127.0.0.1:{port}`.
+- Spawn with `IGGY_SYSTEM_PATH={config_dir}/OrionII/iggy/`, `IGGY_TCP_ADDRESS=127.0.0.1:{port}`,
+  and deterministic first-run root credentials (`IGGY_ROOT_USERNAME=iggy`,
+  `IGGY_ROOT_PASSWORD=iggy`) so the bundled client can authenticate without user setup.
 - Wait for the TCP port to accept connections (`STARTUP_TIMEOUT = 15s`).
 - Supervise: on unexpected child exit, restart up to 3 times in 60 seconds. After that, give up and publish a `Topic::GovernanceInbound` envelope with `kind: "broker-unstable"` so the UI can surface the failure mode.
 - On `Drop` (e.g. `apply_bundle_config` hot-swap or app shutdown), `start_kill()` the child synchronously; `kill_on_drop(true)` ensures cleanup if the process panics before reaching `Drop`.
@@ -80,12 +84,26 @@ The `rotate_iggy_token` Tauri command is shipped now and exercises the file path
 
 ### Sidecar binary distribution
 
-The binaries themselves are **not vendored** in this repo. `src-tauri/binaries/README.md` documents the manual install procedure (`cargo install iggy-server` or download from GitHub releases). The supervisor's `locate_binary()` picks them up from PATH, env-var override, or the OrionII install directory.
+Release builds run `scripts/build-installer.ps1`. That script prepares the sidecar first, then
+sets a Tauri config overlay with `bundle.externalBin = ["binaries/iggy-server"]` for the MSI
+build. Keeping `externalBin` in the release overlay instead of the default `tauri.conf.json`
+lets normal `cargo check` work on clean developer machines before the sidecar has been built.
+
+`scripts/prepare-iggy-sidecar.ps1` copies a prebuilt `iggy-server.exe` from
+`ORIONII_IGGY_SERVER` / `-PrebuiltPath`, or downloads one from `ORIONII_IGGY_SERVER_URL` /
+`-PrebuiltUrl` with optional `ORIONII_IGGY_SERVER_SHA256` verification. The resulting file lands
+in `src-tauri/binaries/` using Tauri's external sidecar naming convention. The supervisor's
+`locate_binary()` picks it up from the OrionII install directory, env-var override, or PATH.
+
+The script retains `-AllowSourceBuild` as an escape hatch, but it is not the default on Windows:
+Apache Iggy server `server-0.7.0` currently fails on clean Windows runners (`hwloc/pkg-config`
+and later `nix` compile issues). Release builds should use a vetted prebuilt Windows sidecar
+until Apache publishes official Windows server convenience binaries.
 
 Phase 2.1 work:
-- Vendor `iggy-server-{target-triple}` binaries (Win/macOS-x64/macOS-arm64/Linux) in `src-tauri/binaries/`.
-- Register them in `tauri.conf.json` `bundle.externalBin` so `tauri build` packages them.
-- Add a `build.rs` that downloads + SHA-256-verifies them on first build, refusing to ship if checksums don't match.
+- Add macOS/Linux sidecar preparation when we ship non-Windows bundles.
+- Replace the prebuilt-binary handoff with checksum-pinned official binary downloads once Apache Iggy publishes Windows server convenience binaries.
+- Add checksum verification, refusing to ship if checksums don't match.
 
 ## Consequences
 
@@ -122,10 +140,13 @@ Phase 2.1 work:
 1. **Compile clean**: `cargo check` clean as of this commit.
 2. **In-memory path still passes**: `cargo test --lib` — 24 tests pass, 0 ignored.
 3. **Iggy compile path verified**: `bus/iggy.rs`, `iggy_auth.rs`, `iggy_supervisor.rs` all compile-clean with the iggy 0.10 client; the iggy crate's own dependencies (turso, openssl-src) are *not* pulled in by us — only the client surface.
-4. **End-to-end smoke** (requires user-side iggy-server, deferred to user verification):
-   - Install iggy-server (`cargo install iggy-server` or release binary).
-   - Set `bus_transport: { kind: "bundled_iggy" }` in `config.json`.
-   - `npm run tauri dev`. Type "hello": user message + orion reply, same UX as in-memory.
+4. **End-to-end smoke** (release bundle path):
+   - Provide a vetted Windows `iggy-server.exe` via `ORIONII_IGGY_SERVER` or
+     `ORIONII_IGGY_SERVER_URL` + `ORIONII_IGGY_SERVER_SHA256`.
+   - Build the MSI with `npm run build:installer`.
+   - Register that MSI in SAO, download an agent bundle, and run `Install-OrionII.cmd` so
+     `%APPDATA%/OrionII/config.json` contains `bus_transport: { kind: "bundled_iggy" }`.
+   - Launch the installed OrionII. Type "hello": user message + orion reply, same UX as in-memory.
    - `iggy-cli message poll --stream orionii.entity.{orion_id} --topic ego.action` shows the published envelope.
    - **Restart** OrionII. Confirm previous envelopes are replayable on the iggy node.
    - Force-kill OrionII mid-chat. Restart. Confirm pending `EgressOutbound` envelopes are still on the bus and the egress subscriber resumes shipping them.

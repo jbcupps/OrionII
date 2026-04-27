@@ -39,45 +39,65 @@ npm run tauri dev          # full app
 - `src-tauri/src/orion/bus/inmem.rs` — Phase 1 in-process implementation over `tokio::sync::broadcast`.
 - `src-tauri/src/orion/{id,ego,superego_local,egress}.rs` — bus participants. Each exposes a `spawn(...)` function that returns a `JoinHandle`.
 - `src-tauri/src/orion/service.rs` — `OrionCore` constructs the bus and spawns the participants in `OrionCore::build()`. This is the only place participant modules are imported together.
-- `src-tauri/src/lib.rs` — Tauri command bodies are thin adapters. `send_chat_message` publishes to `mentor.input` and returns a correlation id; the chat reply arrives later on the `orion://ego.action` Tauri event.
-- `src/App.tsx` — `useEffect` listens for `orion://ego.action` and appends the orion message to the transcript. Do not move chat output back into the command return.
+- `src-tauri/src/lib.rs` — Tauri command bodies are thin adapters. `send_chat_message` publishes to `mentor.input` and returns a correlation id; the chat reply arrives later on the `orion://ego/action` Tauri event.
+- `src/App.tsx` — `useEffect` listens for `orion://ego/action` and appends the orion message to the transcript. Do not move chat output back into the command return.
 
-## Bus transport (Phase 2b)
+## Bus transport
 
-OrionII can run the entity bus on either an in-memory broadcast channel
-(default; what Phase 1 / 2a shipped) or an iggy-server sidecar (Phase
-2b; durable across restarts). The transport is selected per-entity in
-`config.json` via the `bus_transport` field — see ADR-002.
+OrionII can run the entity bus on an in-memory broadcast channel
+(default for dev/offline), a bundled NATS JetStream sidecar (product
+durable path), or the earlier Iggy adapters (experimental until a
+reliable Windows `iggy-server.exe` distribution exists). The transport is
+selected per-entity in `config.json` via the `bus_transport` field — see
+ADR-003.
 
 ```jsonc
 // In-memory (default; same as Phase 1)
 "bus_transport": { "kind": "in_memory" }
 
-// Bundled iggy-server sidecar (durable; supervisor manages lifecycle)
+// Bundled nats-server sidecar with JetStream (durable product path)
+"bus_transport": { "kind": "nats_jetstream", "port": 4222 }
+
+// Bundled iggy-server sidecar (experimental)
 "bus_transport": { "kind": "bundled_iggy", "port": 8090 }
+
+// External NATS JetStream node (advanced)
+"bus_transport": { "kind": "external_nats_jetstream", "endpoint": "nats://127.0.0.1:4222" }
 
 // External iggy node (advanced)
 "bus_transport": { "kind": "external_iggy", "endpoint": "tcp://127.0.0.1:8090", "pat": "iggy:iggy" }
 ```
 
-When `bundled_iggy` is selected, OrionII spawns an `iggy-server` child
-process. Until Phase 2.1 vendors the binaries, install it manually
-(`cargo install iggy-server` or download a release; see
-`src-tauri/binaries/README.md`). The supervisor restarts the sidecar
-on crash up to 3 times in 60s, then publishes a `GovernanceInbound`
-envelope with `kind: "broker-unstable"`.
+When `nats_jetstream` is selected, OrionII spawns a `nats-server` child
+process with JetStream enabled, bound to `127.0.0.1`, and stores data in
+`{config_dir}/OrionII/nats`. Release MSI builds use
+`scripts/build-installer.ps1` to download/prepare and package that
+sidecar through Tauri `externalBin`; development/release can point
+`ORIONII_NATS_SERVER` at a prebuilt binary or set
+`ORIONII_NATS_SERVER_URL` plus `ORIONII_NATS_SERVER_SHA256`. The
+supervisor restarts the sidecar on crash up to 3 times in 60s, then
+publishes a `GovernanceInbound` envelope with `kind: "broker-unstable"`.
+
+The Iggy path remains available for adapter work, but it is no longer the
+default product packaging path on Windows.
 
 Personal Access Tokens live at `{config_dir}/OrionII/iggy_pat` (mode
 600). The `rotate_iggy_token` Tauri command rotates them. Phase 2b's
 PAT-mint flow is a stand-in (`TODO(phase-2b-pat-mint)` in
 `iggy_auth.rs`); the real server-side mint + revoke is Phase 2.1.
 
-Any failure on the iggy path falls back to the in-memory bus with a
-diagnostic log. The entity stays alive even when the broker doesn't.
+Any failure on a durable broker path falls back to the in-memory bus with
+a diagnostic log. The entity stays alive even when the broker doesn't.
 
 ## Phase 1 / 2a / 2b known limitations
 
 - The egress sanitizer is a key-name-redaction stub (`secret|token|key|password`). Real NPPI policy is a follow-up — but it plugs into the same seam.
 - `soul_ref` is a surrogate (`orion_id:vN`). When SAO ships a signed `soul.md` blob at birth, swap to `hex(blake3(...))` in `bus::current_soul_ref` — every callsite already uses the helper.
-- The Phase 2b PAT auth uses iggy's bootstrap admin pair (`iggy:iggy`) cast as a PAT-shaped string — dev-grade only. Real PAT mint + OS keychain integration is Phase 2.1.
-- The bundled-iggy sidecar binaries are not vendored yet. `src-tauri/binaries/README.md` has the manual install procedure; `tauri build` does not yet package an iggy-server.
+- The default packaged durable bus is NATS JetStream, bundled by
+  `npm run build:installer`, not plain `tauri build`.
+- The Iggy PAT auth uses iggy's bootstrap admin pair (`iggy:iggy`) cast
+  as a PAT-shaped string — dev-grade only. Real PAT mint + OS keychain
+  integration is deferred unless Iggy becomes product-default again.
+- Official Apache Iggy Windows server binaries are not available yet; the
+  optional Iggy release path still requires a vetted prebuilt
+  `iggy-server.exe` path/URL and can SHA-256 verify it.

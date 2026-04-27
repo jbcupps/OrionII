@@ -153,6 +153,11 @@ pub struct SaoShipper {
     client: reqwest::Client,
 }
 
+pub struct SaoPolicyClient {
+    config: Option<SaoClientConfig>,
+    client: reqwest::Client,
+}
+
 impl Default for SaoShipper {
     fn default() -> Self {
         Self {
@@ -257,6 +262,15 @@ impl SaoShipper {
         }
         report.failed = report.attempted.saturating_sub(report.acked);
         report
+    }
+}
+
+impl SaoPolicyClient {
+    pub fn with_config(config: Option<SaoClientConfig>) -> Self {
+        Self {
+            config,
+            client: reqwest::Client::new(),
+        }
     }
 
     pub async fn fetch_policy(&self) -> Result<PolicyOverlay, SaoClientError> {

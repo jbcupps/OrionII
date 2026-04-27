@@ -13,6 +13,8 @@
 //! when the bus consolidated to the canonical 8-topic vocabulary. They
 //! return as ADR-gated topic additions when those features re-land.
 
+#![allow(dead_code)]
+
 pub const MENTOR_INPUT: &str = "mentor.input";
 pub const ID_STIMULUS: &str = "id.stimulus";
 pub const ID_REACTION: &str = "id.reaction";

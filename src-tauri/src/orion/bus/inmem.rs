@@ -1,6 +1,6 @@
 //! In-process bus over `tokio::sync::broadcast`. Phase 1/2a default.
 //!
-//! Replaced by an Iggy-backed implementation in Phase 2b (see ADR-002).
+//! Replaced by durable broker implementations in packaged builds (see ADR-003).
 //! Keep this file small. Anything that grows here probably belongs
 //! upstream of the bus, not inside it.
 
@@ -77,7 +77,9 @@ mod tests {
         bus.publish(env(Topic::MentorInput, "hello")).await.unwrap();
 
         let mut rx = bus.subscribe(Topic::MentorInput);
-        bus.publish(env(Topic::MentorInput, "second")).await.unwrap();
+        bus.publish(env(Topic::MentorInput, "second"))
+            .await
+            .unwrap();
         let received = rx.recv().await.unwrap();
         assert_eq!(received.topic, Topic::MentorInput);
         assert_eq!(received.payload["body"], "second");
@@ -89,7 +91,9 @@ mod tests {
         let mut rx1 = bus.subscribe(Topic::EgoAction);
         let mut rx2 = bus.subscribe(Topic::EgoAction);
 
-        bus.publish(env(Topic::EgoAction, "broadcast")).await.unwrap();
+        bus.publish(env(Topic::EgoAction, "broadcast"))
+            .await
+            .unwrap();
 
         let a = rx1.recv().await.unwrap();
         let b = rx2.recv().await.unwrap();

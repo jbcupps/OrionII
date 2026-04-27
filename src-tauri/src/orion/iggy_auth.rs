@@ -113,6 +113,12 @@ fn set_restricted_permissions(_path: &Path) -> Result<(), AuthError> {
 /// fine for single-user single-machine dev but must change before any
 /// multi-tenant or cloud deploy.
 pub async fn provision_first_run(endpoint: &str) -> Result<IggyCredentials, AuthError> {
+    if endpoint.trim().is_empty() {
+        return Err(AuthError::Provision(
+            "cannot provision Iggy credentials without an endpoint".to_string(),
+        ));
+    }
+
     Ok(IggyCredentials {
         endpoint: endpoint.to_string(),
         // Iggy's documented bootstrap pair, used as a stand-in PAT until

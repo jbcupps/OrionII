@@ -37,15 +37,19 @@ That file is the **one ethical seam** between the entity and SAO. Any change sho
 - `sanitize()` runs before `enqueue_sao` / `ship_sao_egress` is called.
 - No other module calls `SaoShipper::ship_pending` directly. (The user-triggered Tauri command `ship_sao_egress` calls `core.ship_sao_egress()` which goes through `persistence.ship_sao_egress` — same path.)
 
-## Bus transport (Phase 2b)
+## Bus transport
 
-OrionII supports three transports behind the `EventBus` trait. The
-choice lives in `config.json` → `bus_transport` (see ADR-002):
+OrionII supports durable and non-durable transports behind the
+`EventBus` trait. The choice lives in `config.json` → `bus_transport`
+(see ADR-003):
 
 - `in_memory` — tokio broadcast, no durability. Default.
-- `bundled_iggy` — local iggy-server sidecar managed by
-  `iggy_supervisor`. Durable across restarts.
-- `external_iggy` — connect to an externally managed Iggy node.
+- `nats_jetstream` — product durable path. Local nats-server sidecar
+  managed by `nats_supervisor`; JetStream stores envelopes on disk.
+- `external_nats_jetstream` — connect to an externally managed NATS node.
+- `bundled_iggy` — experimental local iggy-server sidecar managed by
+  `iggy_supervisor`.
+- `external_iggy` — experimental externally managed Iggy node.
 
 When you change anything bus-related, check that:
 
@@ -53,8 +57,13 @@ When you change anything bus-related, check that:
       `rx.recv().await` is identical across transports.
 - [ ] Any new failure mode falls back to `InMemoryBus` with a log,
       not a panic. The entity stays alive even when the broker doesn't.
-- [ ] The supervisor still spawns iggy-server with `kill_on_drop(true)`
-      so a crashed OrionII never leaks the child.
+- [ ] The relevant supervisor still spawns its child with `kill_on_drop(true)`
+      so a crashed OrionII never leaks the broker.
+- [ ] Release packaging still goes through `scripts/build-installer.ps1`, which prepares the
+      sidecar and enables Tauri `externalBin` for the MSI build. Product Windows packaging
+      uses `nats-server.exe` via the official release ZIP or `ORIONII_NATS_SERVER`; Iggy
+      packaging remains optional through `-BusSidecar iggy`. Do not put `externalBin` back
+      into the default `tauri.conf.json`; that breaks clean-machine `cargo check`.
 - [ ] `rotate_iggy_token` is the only entry point that writes the
       PAT store. The PAT store is `{config_dir}/OrionII/iggy_pat`
       with mode 600 on Unix; do not store it elsewhere.

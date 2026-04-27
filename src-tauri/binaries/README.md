@@ -1,89 +1,63 @@
-# `iggy-server` sidecar binaries
+# Broker sidecar binaries
 
-Phase 2b ships the **logic** to run a bundled iggy-server sidecar (see
-`src-tauri/src/orion/iggy_supervisor.rs`), but the binaries themselves
-are not yet vendored in this repo. Auto-download with checksum
-verification is a Phase 2.1 packaging ticket.
+Release installer builds prepare a local broker sidecar here, then enable
+Tauri `externalBin` only for the MSI build. The default `tauri.conf.json`
+intentionally does not list external binaries so clean-machine `cargo check`
+does not require a prepared sidecar.
 
-## How to use Iggy on this branch (dev)
+## Product default: NATS JetStream
 
-For development, do one of these:
-
-### Option A — install iggy-server on PATH
-
-```bash
-# macOS / Linux (cargo)
-cargo install iggy-server --version 0.10
-# or via the official release binaries from
-# https://github.com/apache/iggy/releases
-```
+`npm run build:installer` runs:
 
 ```powershell
-# Windows
-# Download iggy-server.exe from
-# https://github.com/apache/iggy/releases
-# and place it on %PATH% or alongside OrionII.exe.
+.\scripts\build-installer.ps1
 ```
 
-The supervisor's `locate_binary()` checks `PATH` last, so a
-PATH-installed `iggy-server` is automatically picked up.
+By default that script runs `scripts/prepare-nats-sidecar.ps1`, downloads a
+Windows NATS release ZIP if needed, extracts `nats-server.exe`, and copies it
+using Tauri's sidecar naming convention:
 
-### Option B — point at a specific binary via env var
-
-```bash
-export ORIONII_IGGY_SERVER=/path/to/iggy-server
-# Windows: set ORIONII_IGGY_SERVER=C:\path\to\iggy-server.exe
+```text
+nats-server-x86_64-pc-windows-msvc.exe
 ```
 
-The supervisor checks this env var first.
+The installer overlay includes it through `bundle.externalBin`, so the MSI
+installs the broker together with `orionii.exe`. OrionII starts it with
+JetStream enabled, bound to `127.0.0.1`, with data in
+`%APPDATA%\OrionII\nats`.
 
-### Option C — drop-in next to OrionII
+Development overrides:
 
-In a `tauri build` artifact directory, place a file named
-`iggy-server` (or `iggy-server.exe` on Windows) next to the OrionII
-binary. The supervisor's lookup order resolves it second after the
-env var.
+```powershell
+$env:ORIONII_NATS_SERVER = "C:\path\to\nats-server.exe"
 
-## How to switch to the bundled-Iggy bus
+# or download a pinned artifact
+$env:ORIONII_NATS_SERVER_URL = "https://github.com/nats-io/nats-server/releases/download/v2.12.7/nats-server-v2.12.7-windows-amd64.zip"
+$env:ORIONII_NATS_SERVER_SHA256 = "<expected-sha256>"
+npm run build:installer
+```
 
-In `%APPDATA%\OrionII\config.json` (Windows) or
-`~/.config/OrionII/config.json` (Unix), set:
+Config:
 
-```jsonc
+```json
 {
-  "sao_base_url": "...",
-  "agent_token": "...",
-  "bus_transport": { "kind": "bundled_iggy" }
+  "bus_transport": { "kind": "nats_jetstream", "port": 4222 }
 }
 ```
 
-Or, to talk to an externally managed iggy node:
+## Experimental: Iggy
 
-```jsonc
-{
-  "sao_base_url": "...",
-  "agent_token": "...",
-  "bus_transport": {
-    "kind": "external_iggy",
-    "endpoint": "tcp://127.0.0.1:8090",
-    "pat": "iggy:iggy"
-  }
-}
+The earlier Iggy adapter and supervisor remain in the codebase, but Iggy is
+not the default Windows product sidecar because official Apache Iggy Windows
+server convenience binaries are not published yet.
+
+To build an Iggy installer explicitly:
+
+```powershell
+npm run build:installer:iggy
 ```
 
-If `bus_transport` is omitted, OrionII defaults to in-memory (Phase 1
-behavior).
-
-## Phase 2.1 future work
-
-- Add the target-triple-suffixed binaries to this directory (e.g.
-  `iggy-server-x86_64-pc-windows-msvc.exe`,
-  `iggy-server-aarch64-apple-darwin`, etc.) following Tauri's
-  `externalBin` naming convention.
-- Register them in `tauri.conf.json` under
-  `bundle.externalBin` so `tauri build` packages them.
-- Add a `build.rs` that downloads the binaries from the iggy GitHub
-  release page and verifies SHA-256 checksums on first build.
-- Wire the `tauri::api::process::Command::new_sidecar` resolution
-  into `iggy_supervisor::locate_binary` so bundled installs don't
-  need PATH or env-var fallback.
+On Windows this requires `ORIONII_IGGY_SERVER` or `ORIONII_IGGY_SERVER_URL`
+plus optional `ORIONII_IGGY_SERVER_SHA256`. The source build escape hatch is
+still available through `scripts/build-installer.ps1 -BusSidecar iggy
+-AllowIggySourceBuild`, but it is not reliable on clean Windows runners.

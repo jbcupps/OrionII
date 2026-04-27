@@ -30,8 +30,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Tauri MSI
-        run: npm run tauri build -- --bundles msi
+      - name: Build Tauri MSI with bundled NATS JetStream sidecar
+        shell: pwsh
+        env:
+          ORIONII_NATS_SERVER_URL: ${{ vars.ORIONII_NATS_SERVER_URL }}
+          ORIONII_NATS_SERVER_SHA256: ${{ vars.ORIONII_NATS_SERVER_SHA256 }}
+        run: .\scripts\build-installer.ps1 -Bundles msi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
