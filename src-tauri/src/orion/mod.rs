@@ -7,6 +7,8 @@ pub mod egress;
 pub mod ethics;
 pub mod id;
 pub mod identity;
+pub mod iggy_auth;
+pub mod iggy_supervisor;
 pub mod memory;
 pub mod message;
 pub mod model;

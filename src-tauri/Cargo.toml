@@ -16,10 +16,12 @@ tauri-build = { version = "2.5.6", features = [] }
 async-trait = "0.1"
 chrono = { version = "0.4.44", features = ["serde"] }
 dashmap = "6"
+iggy = "0.10"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "http2"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tauri = { version = "2.10.3", features = [] }
 thiserror = "2.0.18"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
 uuid = { version = "1.23.1", features = ["v4", "serde"] }

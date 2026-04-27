@@ -84,6 +84,38 @@ async fn companion_status(
     Ok(core.companion_status())
 }
 
+/// Rotate the Iggy Personal Access Token in the local PAT store.
+///
+/// Phase 2b: re-runs the provisioning flow against the configured iggy
+/// endpoint and overwrites `iggy_pat`. The actual server-side token
+/// revoke + new-token mint is `TODO(phase-2b-pat-mint)` in
+/// `iggy_auth::provision_first_run`. Until that lands, this command
+/// simply rewrites the file with a freshly-generated stub PAT.
+#[tauri::command]
+async fn rotate_iggy_token(
+    state: tauri::State<'_, Mutex<orion::OrionCore>>,
+) -> Result<String, String> {
+    let core = state.lock().await;
+    let endpoint = match core.iggy_endpoint() {
+        Some(e) => e,
+        None => {
+            return Err(
+                "Iggy is not active on this entity (BusTransport is InMemory)".to_string(),
+            )
+        }
+    };
+    let path = orion::iggy_auth::pat_store_path()
+        .map_err(|e| format!("PAT store path: {e}"))?;
+    let creds = orion::iggy_auth::provision_first_run(&endpoint)
+        .await
+        .map_err(|e| format!("PAT provision: {e}"))?;
+    orion::iggy_auth::save(&path, &creds).map_err(|e| format!("PAT save: {e}"))?;
+    Ok(format!(
+        "Rotated PAT written to {}; restart OrionII to apply",
+        path.display()
+    ))
+}
+
 #[tauri::command]
 async fn sao_connection_status(
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
@@ -215,6 +247,7 @@ pub fn run() {
             refresh_sao_policy,
             ship_sao_egress,
             companion_status,
+            rotate_iggy_token,
             sao_connection_status,
             apply_bundle_config
         ])

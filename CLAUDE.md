@@ -42,8 +42,42 @@ npm run tauri dev          # full app
 - `src-tauri/src/lib.rs` — Tauri command bodies are thin adapters. `send_chat_message` publishes to `mentor.input` and returns a correlation id; the chat reply arrives later on the `orion://ego.action` Tauri event.
 - `src/App.tsx` — `useEffect` listens for `orion://ego.action` and appends the orion message to the transcript. Do not move chat output back into the command return.
 
-## Phase 1 known limitations
+## Bus transport (Phase 2b)
 
-- The integration test in `service.rs` (`mentor_input_round_trips_to_ego_action`) is `#[ignore]`d because `OllamaModelProvider` / `SaoProxyProvider` use `reqwest::blocking::Client`, whose nested tokio runtime panics on drop inside an async test. Converting those to async `reqwest` is the natural unblocker.
+OrionII can run the entity bus on either an in-memory broadcast channel
+(default; what Phase 1 / 2a shipped) or an iggy-server sidecar (Phase
+2b; durable across restarts). The transport is selected per-entity in
+`config.json` via the `bus_transport` field — see ADR-002.
+
+```jsonc
+// In-memory (default; same as Phase 1)
+"bus_transport": { "kind": "in_memory" }
+
+// Bundled iggy-server sidecar (durable; supervisor manages lifecycle)
+"bus_transport": { "kind": "bundled_iggy", "port": 8090 }
+
+// External iggy node (advanced)
+"bus_transport": { "kind": "external_iggy", "endpoint": "tcp://127.0.0.1:8090", "pat": "iggy:iggy" }
+```
+
+When `bundled_iggy` is selected, OrionII spawns an `iggy-server` child
+process. Until Phase 2.1 vendors the binaries, install it manually
+(`cargo install iggy-server` or download a release; see
+`src-tauri/binaries/README.md`). The supervisor restarts the sidecar
+on crash up to 3 times in 60s, then publishes a `GovernanceInbound`
+envelope with `kind: "broker-unstable"`.
+
+Personal Access Tokens live at `{config_dir}/OrionII/iggy_pat` (mode
+600). The `rotate_iggy_token` Tauri command rotates them. Phase 2b's
+PAT-mint flow is a stand-in (`TODO(phase-2b-pat-mint)` in
+`iggy_auth.rs`); the real server-side mint + revoke is Phase 2.1.
+
+Any failure on the iggy path falls back to the in-memory bus with a
+diagnostic log. The entity stays alive even when the broker doesn't.
+
+## Phase 1 / 2a / 2b known limitations
+
 - The egress sanitizer is a key-name-redaction stub (`secret|token|key|password`). Real NPPI policy is a follow-up — but it plugs into the same seam.
 - `soul_ref` is a surrogate (`orion_id:vN`). When SAO ships a signed `soul.md` blob at birth, swap to `hex(blake3(...))` in `bus::current_soul_ref` — every callsite already uses the helper.
+- The Phase 2b PAT auth uses iggy's bootstrap admin pair (`iggy:iggy`) cast as a PAT-shaped string — dev-grade only. Real PAT mint + OS keychain integration is Phase 2.1.
+- The bundled-iggy sidecar binaries are not vendored yet. `src-tauri/binaries/README.md` has the manual install procedure; `tauri build` does not yet package an iggy-server.

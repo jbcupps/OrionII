@@ -37,6 +37,48 @@ struct BundleConfig {
     #[serde(default)]
     #[allow(dead_code)]
     client_version_min: Option<String>,
+    /// Phase 2b: which transport the entity bus runs on. Defaults to
+    /// `InMemory` so existing dev configs keep working unchanged.
+    #[serde(default)]
+    bus_transport: BusTransport,
+}
+
+/// Bus transport selection. The `EventBus` trait abstracts over both, so
+/// callers don't change shape — only the concrete impl swaps. See
+/// docs/ADR-002-iggy-transport.md.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum BusTransport {
+    /// Phase 1/2a: tokio broadcast channels in-process. No durability.
+    /// Default for dev and tests.
+    InMemory,
+    /// Phase 2b: a Tauri-bundled iggy-server sidecar managed by
+    /// `iggy_supervisor`. Durable across restarts; Personal Access Token
+    /// auto-provisioned on first run and stored in the per-user
+    /// `iggy_pat` file (mode 600 / restricted ACL).
+    BundledIggy {
+        /// TCP port the sidecar listens on. Defaults to 8090 (Iggy's
+        /// canonical TCP port). Override only if it collides locally.
+        #[serde(default = "default_iggy_tcp_port")]
+        port: u16,
+    },
+    /// Connect to an externally managed Iggy node (testing, advanced
+    /// deployments). Phase 2 does not provision PATs over HTTP for this
+    /// path — supply the token directly via `pat`.
+    ExternalIggy {
+        endpoint: String,
+        pat: String,
+    },
+}
+
+impl Default for BusTransport {
+    fn default() -> Self {
+        BusTransport::InMemory
+    }
+}
+
+fn default_iggy_tcp_port() -> u16 {
+    8090
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +89,8 @@ pub struct OrionBootstrap {
     pub assigned_agent_id: Option<Uuid>,
     /// Live birth payload from SAO, populated when `/api/orion/birth` succeeds.
     pub birth: Option<BirthResponse>,
+    /// Phase 2b: which transport the entity bus uses.
+    pub bus_transport: BusTransport,
 }
 
 impl OrionBootstrap {
@@ -83,6 +127,7 @@ impl OrionBootstrap {
                 model,
                 assigned_agent_id: bundle.agent_id,
                 birth: None,
+                bus_transport: bundle.bus_transport.clone(),
             }
         } else {
             // No bundle — fall back to env-based dev flow.
@@ -91,6 +136,7 @@ impl OrionBootstrap {
                 model: ModelConfig::default(),
                 assigned_agent_id: None,
                 birth: None,
+                bus_transport: BusTransport::default(),
             }
         };
 

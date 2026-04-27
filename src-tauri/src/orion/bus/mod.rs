@@ -38,8 +38,10 @@ use uuid::Uuid;
 
 use crate::orion::identity::IdentityState;
 
+pub mod iggy;
 pub mod inmem;
 
+pub use iggy::IggyBus;
 pub use inmem::InMemoryBus;
 
 /// Canonical topic set for the entity-internal bus.
@@ -143,17 +145,21 @@ impl From<broadcast::error::RecvError> for RecvError {
     }
 }
 
-/// Subscriber-side handle. Wraps either a tokio broadcast receiver
-/// (`InMemoryBus`) or — in Phase 2b — an Iggy consumer. Subscribers
-/// don't need to know which.
+/// Subscriber-side handle. Wraps either a tokio broadcast receiver from
+/// `InMemoryBus`, or a per-topic broadcast receiver fed by `IggyBus`'s
+/// polling task. Subscribers don't need to know which.
+///
+/// Both variants are tokio broadcast receivers — what differs is who feeds
+/// them. The `InMemory` variant is fed by the publisher directly; the
+/// `Iggy` variant is fed by `IggyBus`'s per-topic polling task pulling
+/// from the iggy server.
 pub struct BusReceiver {
     inner: BusReceiverInner,
 }
 
 enum BusReceiverInner {
     InMemory(broadcast::Receiver<Envelope>),
-    // Iggy variant added in Phase 2b. Present-day code routes only the
-    // in-memory path; adding a variant here is non-breaking for callers.
+    Iggy(broadcast::Receiver<Envelope>),
 }
 
 impl BusReceiver {
@@ -163,9 +169,16 @@ impl BusReceiver {
         }
     }
 
+    pub fn from_iggy(rx: broadcast::Receiver<Envelope>) -> Self {
+        Self {
+            inner: BusReceiverInner::Iggy(rx),
+        }
+    }
+
     pub async fn recv(&mut self) -> Result<Envelope, RecvError> {
         match &mut self.inner {
             BusReceiverInner::InMemory(rx) => rx.recv().await.map_err(RecvError::from),
+            BusReceiverInner::Iggy(rx) => rx.recv().await.map_err(RecvError::from),
         }
     }
 }

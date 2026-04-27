@@ -37,6 +37,36 @@ That file is the **one ethical seam** between the entity and SAO. Any change sho
 - `sanitize()` runs before `enqueue_sao` / `ship_sao_egress` is called.
 - No other module calls `SaoShipper::ship_pending` directly. (The user-triggered Tauri command `ship_sao_egress` calls `core.ship_sao_egress()` which goes through `persistence.ship_sao_egress` — same path.)
 
+## Bus transport (Phase 2b)
+
+OrionII supports three transports behind the `EventBus` trait. The
+choice lives in `config.json` → `bus_transport` (see ADR-002):
+
+- `in_memory` — tokio broadcast, no durability. Default.
+- `bundled_iggy` — local iggy-server sidecar managed by
+  `iggy_supervisor`. Durable across restarts.
+- `external_iggy` — connect to an externally managed Iggy node.
+
+When you change anything bus-related, check that:
+
+- [ ] No subscriber call site changed shape — `bus.subscribe(t)` /
+      `rx.recv().await` is identical across transports.
+- [ ] Any new failure mode falls back to `InMemoryBus` with a log,
+      not a panic. The entity stays alive even when the broker doesn't.
+- [ ] The supervisor still spawns iggy-server with `kill_on_drop(true)`
+      so a crashed OrionII never leaks the child.
+- [ ] `rotate_iggy_token` is the only entry point that writes the
+      PAT store. The PAT store is `{config_dir}/OrionII/iggy_pat`
+      with mode 600 on Unix; do not store it elsewhere.
+
+## Before you add a Tauri command (Phase 2b reminder)
+
+Async-fn commands hold the `tokio::sync::Mutex<OrionCore>` guard
+across `.await`. That's deliberate (Send-safe across worker threads),
+but it means commands serialize on each other. If you find yourself
+adding a command that takes a long time, check whether it should
+publish to a topic and let a subscriber handle it instead.
+
 ## Topic vocabulary
 
 The canonical 8 (do not add without an ADR):

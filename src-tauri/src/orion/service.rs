@@ -8,11 +8,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::orion::birth::BirthResponse;
-use crate::orion::bootstrap::OrionBootstrap;
+use crate::orion::bootstrap::{BusTransport, OrionBootstrap};
 use crate::orion::bus::{
-    current_soul_ref, BusError, Envelope, InMemoryBus, RecvError, SharedBus, Topic,
+    current_soul_ref, BusError, Envelope, IggyBus, InMemoryBus, RecvError, SharedBus, Topic,
 };
 use crate::orion::ego::EgoActionPayload;
+use crate::orion::iggy_auth;
+use crate::orion::iggy_supervisor::IggySupervisor;
 use crate::orion::model::{ModelCallStatus, ModelProviderKind, ModelRouter};
 #[cfg(test)]
 use crate::orion::model::ModelConfig;
@@ -74,6 +76,11 @@ pub struct OrionCore {
     /// final `Arc` reference is released, but explicit `abort()` here makes
     /// shutdown deterministic.
     handles: Vec<JoinHandle<()>>,
+    /// Phase 2b: live iggy-server sidecar when running on the
+    /// `BundledIggy` transport. Held so its `Drop` SIGKILLs the child on
+    /// hot-swap or app shutdown.
+    #[allow(dead_code)]
+    iggy_supervisor: Option<IggySupervisor>,
 }
 
 impl Default for OrionCore {
@@ -116,7 +123,26 @@ impl OrionCore {
             _ => Arc::new(ModelRouter::new(bootstrap.model.clone())),
         };
 
-        let bus: SharedBus = InMemoryBus::new();
+        // Bus selection. The `EventBus` trait abstracts both transports;
+        // subscribers below don't change shape between them. Any failure
+        // in the iggy path falls back to the in-memory bus with a
+        // diagnostic log — the entity stays alive even if the broker
+        // doesn't.
+        let orion_id = persistence
+            .lock()
+            .expect("persistence mutex poisoned")
+            .identity()
+            .identity
+            .orion_id;
+
+        let (bus, iggy_supervisor): (SharedBus, Option<IggySupervisor>) =
+            match select_bus(&bootstrap.bus_transport, orion_id).await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    eprintln!("[orion-core] iggy bus path failed: {error}; falling back to in-memory");
+                    (InMemoryBus::new(), None)
+                }
+            };
 
         let mut handles = Vec::new();
         handles.push(id::spawn(bus.clone(), persistence.clone(), model.clone()));
@@ -141,6 +167,7 @@ impl OrionCore {
             sao_config: bootstrap.sao,
             birth: bootstrap.birth,
             handles,
+            iggy_supervisor,
         }
     }
 
@@ -184,6 +211,7 @@ impl OrionCore {
             sao_config: None,
             birth: None,
             handles,
+            iggy_supervisor: None,
         }
     }
 
@@ -285,6 +313,15 @@ impl OrionCore {
         self.sao_config.as_ref()
     }
 
+    /// Returns the iggy-server endpoint when running on the
+    /// `BundledIggy` transport; `None` otherwise. Used by the
+    /// `rotate_iggy_token` command.
+    pub fn iggy_endpoint(&self) -> Option<String> {
+        self.iggy_supervisor
+            .as_ref()
+            .map(|s| s.endpoint().to_string())
+    }
+
     pub fn companion_status(&self) -> CompanionStatusReport {
         let p = self.persistence.lock().expect("persistence mutex poisoned");
         let security = self.verifier.verify("local constitutional scaffold", None);
@@ -318,6 +355,97 @@ struct UiEgoActionEvent {
     correlation_id: Option<Uuid>,
     user_query: String,
     response_text: String,
+}
+
+/// Resolve which bus transport to construct. Returns the bus + (when
+/// applicable) the iggy supervisor handle. Errors here are non-fatal: the
+/// caller falls back to in-memory and continues.
+async fn select_bus(
+    transport: &BusTransport,
+    orion_id: Uuid,
+) -> Result<(SharedBus, Option<IggySupervisor>), String> {
+    match transport {
+        BusTransport::InMemory => Ok((InMemoryBus::new(), None)),
+
+        BusTransport::BundledIggy { port } => {
+            // The supervisor needs a SharedBus to publish broker-unstable
+            // governance into. We give it a temporary in-memory bus
+            // initially, then construct the real IggyBus and let the
+            // supervisor watcher continue using its temp handle. The
+            // governance envelope is informational only at this point —
+            // future Phase 2.1 will plumb the real bus through to the
+            // supervisor after IggyBus is built.
+            let supervisor_bus: SharedBus = InMemoryBus::new();
+            let supervisor = IggySupervisor::start(*port, supervisor_bus)
+                .await
+                .map_err(|e| format!("supervisor start: {e}"))?;
+            let endpoint_no_scheme = supervisor
+                .endpoint()
+                .trim_start_matches("tcp://")
+                .to_string();
+            let creds = load_or_provision_creds(supervisor.endpoint()).await;
+            let (user, pass) = parse_pat(&creds.pat);
+            let iggy_bus = IggyBus::connect(&endpoint_no_scheme, &user, &pass, orion_id)
+                .await
+                .map_err(|e| format!("iggy connect: {e}"))?;
+            Ok((iggy_bus as SharedBus, Some(supervisor)))
+        }
+
+        BusTransport::ExternalIggy { endpoint, pat } => {
+            let endpoint_no_scheme = endpoint.trim_start_matches("tcp://").to_string();
+            let (user, pass) = parse_pat(pat);
+            let iggy_bus = IggyBus::connect(&endpoint_no_scheme, &user, &pass, orion_id)
+                .await
+                .map_err(|e| format!("external iggy connect: {e}"))?;
+            Ok((iggy_bus as SharedBus, None))
+        }
+    }
+}
+
+/// Phase 2b PAT format: `username:password` until the real PAT-mint flow
+/// in `iggy_auth` lands. The split-at-`:` parser falls back to bootstrap
+/// credentials if the format is unrecognised. See ADR-002 § "PAT auth".
+fn parse_pat(pat: &str) -> (String, String) {
+    if let Some((user, pass)) = pat.split_once(':') {
+        (user.to_string(), pass.to_string())
+    } else {
+        // Treat the whole string as a token; iggy bootstrap admin
+        // user/pass is the documented default.
+        ("iggy".to_string(), "iggy".to_string())
+    }
+}
+
+async fn load_or_provision_creds(endpoint: &str) -> iggy_auth::IggyCredentials {
+    let path = match iggy_auth::pat_store_path() {
+        Ok(p) => p,
+        Err(error) => {
+            eprintln!("[orion-core] could not resolve PAT store path: {error}; using bootstrap creds");
+            return iggy_auth::IggyCredentials {
+                endpoint: endpoint.to_string(),
+                pat: "iggy:iggy".to_string(),
+            };
+        }
+    };
+    match iggy_auth::load(&path) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            let provisioned = iggy_auth::provision_first_run(endpoint).await.ok();
+            if let Some(c) = &provisioned {
+                let _ = iggy_auth::save(&path, c);
+            }
+            provisioned.unwrap_or_else(|| iggy_auth::IggyCredentials {
+                endpoint: endpoint.to_string(),
+                pat: "iggy:iggy".to_string(),
+            })
+        }
+        Err(error) => {
+            eprintln!("[orion-core] PAT store load failed: {error}; using bootstrap creds");
+            iggy_auth::IggyCredentials {
+                endpoint: endpoint.to_string(),
+                pat: "iggy:iggy".to_string(),
+            }
+        }
+    }
 }
 
 fn spawn_ui_emitter(bus: SharedBus, app: AppHandle) -> JoinHandle<()> {
