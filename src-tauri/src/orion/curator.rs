@@ -1,10 +1,8 @@
-use crate::orion::ethics::EthicsOverlay;
+use crate::orion::ethics::{EthicsOverlay, EthicsScaffoldInput};
 use crate::orion::id::{IdRuntime, IdSignal};
 use crate::orion::identity::IdentityState;
-use crate::orion::message::{Author, Message, MessageKind, Payload, Priority};
 use crate::orion::model::ModelProvider;
 use crate::orion::skills::DocumentSkill;
-use crate::orion::topics;
 
 #[derive(Default)]
 pub struct CuratorRuntime {
@@ -12,29 +10,33 @@ pub struct CuratorRuntime {
     documents: DocumentSkill,
 }
 
-pub struct CuratedTurn {
+/// Raw curated payload — the data shape the bus pipeline carries on
+/// `Topic::IdReaction`. Subscribers consume this directly; there are no
+/// `Message` round-trips inside the bus.
+pub struct CuratedRaw {
     pub id_signal: IdSignal,
-    pub ethics: EthicsOverlay,
-    pub instruction: Message,
+    pub system_prompt: String,
+    pub context_summary: String,
+    pub ethics_guidance: Vec<String>,
 }
 
 impl CuratorRuntime {
-    pub fn curate(
+    pub fn curate_raw(
         &self,
-        input: &Message,
+        user_query: &str,
         identity: &IdentityState,
         document_context: &str,
         model: &impl ModelProvider,
-    ) -> CuratedTurn {
-        let user_query = match &input.payload {
-            Payload::UserInput { text } => text.clone(),
-            _ => String::new(),
-        };
-
+    ) -> CuratedRaw {
         let id_signal = self
             .id
-            .consult(identity, &user_query, document_context, model);
-        let ethics = EthicsOverlay::scaffold(input, &identity.ethics_lean);
+            .consult(identity, user_query, document_context, model);
+        let ethics = EthicsOverlay::scaffold(
+            EthicsScaffoldInput {
+                user_query,
+            },
+            &identity.ethics_lean,
+        );
         let context_summary = if document_context.is_empty() {
             "No matching local document context.".to_string()
         } else {
@@ -47,25 +49,11 @@ impl CuratorRuntime {
             ethics.guidance.join(" ")
         );
 
-        let instruction = Message::new(
-            MessageKind::CuratedPrompt,
-            Author::Curator,
-            topics::EGO_INSTRUCTIONS,
-            Priority::UserInput,
-            input.session_id,
-            input.correlation_id,
-            Some(input.id),
-            Payload::CuratedPrompt {
-                system_prompt,
-                user_query,
-                context_summary,
-            },
-        );
-
-        CuratedTurn {
+        CuratedRaw {
             id_signal,
-            ethics,
-            instruction,
+            system_prompt,
+            context_summary,
+            ethics_guidance: ethics.guidance,
         }
     }
 

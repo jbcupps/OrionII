@@ -263,7 +263,7 @@ mod tests {
         let message = Message::new(
             MessageKind::UserInput,
             Author::User,
-            topics::USER_CHAT_INPUT,
+            topics::MENTOR_INPUT,
             Priority::UserInput,
             Uuid::new_v4(),
             Uuid::new_v4(),

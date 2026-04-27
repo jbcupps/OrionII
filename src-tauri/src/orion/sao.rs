@@ -5,8 +5,6 @@ use uuid::Uuid;
 
 use crate::orion::identity::IdentityState;
 use crate::orion::memory::MemoryRecord;
-use crate::orion::message::{Author, Message, MessageKind, Payload, Priority};
-use crate::orion::topics;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -357,26 +355,11 @@ pub fn merge_sao_refresh(
     }
 }
 
-pub fn audit_message(
-    session_id: Uuid,
-    correlation_id: Uuid,
-    parent_msg_id: Uuid,
-    action: impl Into<String>,
-) -> Message {
-    Message::new(
-        MessageKind::AuditEvent,
-        Author::Ego,
-        topics::SAO_EGRESS,
-        Priority::Housekeeping,
-        session_id,
-        correlation_id,
-        Some(parent_msg_id),
-        Payload::AuditEvent {
-            action: action.into(),
-            sanitized: true,
-        },
-    )
-}
+// `audit_message` was removed when the bus refactor consolidated egress to
+// the `egress.outbound` subscriber (see ADR-001). Audit events are now
+// generated inside `egress::handle_outbound`, which converts envelopes into
+// `SaoEgressRecord`s — there is no longer a free-standing helper that
+// constructs an audit `Message` from outside that seam.
 
 pub fn sanitize_nppi(input: &str) -> String {
     input

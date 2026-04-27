@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use tauri::Manager;
+
 mod orion;
 
 #[derive(serde::Serialize)]
@@ -19,15 +21,19 @@ struct SaoConnectionStatus {
     policy_version: Option<u64>,
 }
 
+/// Tauri command bodies are intentionally thin adapters: each one publishes
+/// to the bus and returns immediately. The real work happens in subscriber
+/// tasks owned by `OrionCore`. See ADR-001 and AGENTS.md before adding a
+/// new command.
+
 #[tauri::command]
 fn send_chat_message(
     text: String,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<orion::ChatExchange, String> {
-    let mut core = state
+    let core = state
         .lock()
         .map_err(|_| "Orion core state lock was poisoned".to_string())?;
-
     core.send_chat_message(text)
         .map_err(|error| error.to_string())
 }
@@ -38,10 +44,9 @@ fn index_document(
     contents: String,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<usize, String> {
-    let mut core = state
+    let core = state
         .lock()
         .map_err(|_| "Orion core state lock was poisoned".to_string())?;
-
     core.index_document(source_path, contents)
         .map_err(|error| error.to_string())
 }
@@ -51,10 +56,9 @@ fn refresh_sao_policy(
     rules: Vec<String>,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<u64, String> {
-    let mut core = state
+    let core = state
         .lock()
         .map_err(|_| "Orion core state lock was poisoned".to_string())?;
-
     core.apply_sao_policy_refresh(rules)
         .map_err(|error| error.to_string())
 }
@@ -63,11 +67,20 @@ fn refresh_sao_policy(
 fn ship_sao_egress(
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<orion::sao::ShipReport, String> {
-    let mut core = state
+    let core = state
         .lock()
         .map_err(|_| "Orion core state lock was poisoned".to_string())?;
-
     core.ship_sao_egress().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn companion_status(
+    state: tauri::State<'_, Mutex<orion::OrionCore>>,
+) -> Result<orion::service::CompanionStatusReport, String> {
+    let core = state
+        .lock()
+        .map_err(|_| "Orion core state lock was poisoned".to_string())?;
+    Ok(core.companion_status())
 }
 
 #[tauri::command]
@@ -124,6 +137,7 @@ struct ApplyConfigResult {
 #[tauri::command]
 fn apply_bundle_config(
     json: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<ApplyConfigResult, String> {
     let trimmed = json.trim();
@@ -154,7 +168,10 @@ fn apply_bundle_config(
     std::fs::write(&target, pretty)
         .map_err(|e| format!("Failed to write {}: {e}", target.display()))?;
 
-    let new_core = orion::OrionCore::from_bootstrap(orion::bootstrap::OrionBootstrap::load());
+    let new_core = orion::OrionCore::from_bootstrap_with_app(
+        orion::bootstrap::OrionBootstrap::load(),
+        app.clone(),
+    );
     let mut slot = state
         .lock()
         .map_err(|_| "Orion core state lock was poisoned".to_string())?;
@@ -186,12 +203,21 @@ fn config_target_path() -> Option<PathBuf> {
 
 pub fn run() {
     tauri::Builder::default()
-        .manage(Mutex::new(orion::OrionCore::default()))
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let core = orion::OrionCore::from_bootstrap_with_app(
+                orion::bootstrap::OrionBootstrap::load(),
+                handle,
+            );
+            app.manage(Mutex::new(core));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             send_chat_message,
             index_document,
             refresh_sao_policy,
             ship_sao_egress,
+            companion_status,
             sao_connection_status,
             apply_bundle_config
         ])

@@ -1,48 +1,46 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
-type Payload =
-  | { type: "userInput"; data: { text: string } }
-  | { type: "chatOutput"; data: { text: string } }
-  | { type: string; data?: unknown };
+// After the EventBus refactor (see OrionII/docs/ADR-001), the chat surface
+// no longer awaits a `ChatExchange` return value from `send_chat_message`.
+// The command returns immediately with a correlation id; the assistant
+// reply arrives asynchronously on the `orion://ego.action` Tauri event,
+// emitted by the UI emitter subscriber on `Topic::EgoAction`.
 
-type Message = {
-  id: string;
+type ChatAck = {
   correlationId: string;
-  parentMsgId: string | null;
-  kind: string;
-  author: string | { agent: string };
-  topic: string;
-  timestamp: string;
-  ttlCycles: number;
-  ttlMax: number;
-  priority: string;
-  sessionId: string;
-  payload: Payload;
+  accepted: boolean;
 };
 
-type ChatExchange = {
-  input: Message;
-  idSignal: Message;
-  instruction: Message;
-  output: Message;
-  persistedMessages: number;
+type EgoActionEvent = {
+  correlationId: string | null;
+  userQuery: string;
+  responseText: string;
+};
+
+type ModelStatus = {
+  role: string;
+  provider: string;
+  state: string;
+  model: string;
+  message: string | null;
+};
+
+type SecurityHealth = {
+  constitutionalIntegrity: string;
+  checkedAt: string;
+  remediation: string | null;
+};
+
+type CompanionStatusReport = {
   companionId: string;
+  persistedMessages: number;
   saoBacklog: number;
   policyVersion: number;
   memoryCount: number;
-  security: {
-    constitutionalIntegrity: string;
-    checkedAt: string;
-    remediation: string | null;
-  };
-  modelStatus: Array<{
-    role: string;
-    provider: string;
-    state: string;
-    model: string;
-    message: string | null;
-  }>;
+  security: SecurityHealth;
+  modelStatus: ModelStatus[];
 };
 
 type TranscriptMessage = {
@@ -51,15 +49,6 @@ type TranscriptMessage = {
   text: string;
   topic: string;
   correlationId: string;
-};
-
-type CompanionStatus = {
-  companionId: string;
-  saoBacklog: number;
-  policyVersion: number;
-  memoryCount: number;
-  security: ChatExchange["security"];
-  modelStatus: ChatExchange["modelStatus"];
 };
 
 type ShipReport = {
@@ -82,38 +71,26 @@ type SaoConnectionStatus = {
   policyVersion: number | null;
 };
 
-function payloadText(message: Message): string {
-  const data = message.payload.data;
-
-  if (
-    (message.payload.type === "userInput" || message.payload.type === "chatOutput") &&
-    typeof data === "object" &&
-    data !== null &&
-    "text" in data &&
-    typeof data.text === "string"
-  ) {
-    return data.text;
-  }
-
-  return "";
-}
+const EMPTY_STATUS: CompanionStatusReport = {
+  companionId: "not loaded",
+  persistedMessages: 0,
+  saoBacklog: 0,
+  policyVersion: 1,
+  memoryCount: 0,
+  security: {
+    constitutionalIntegrity: "notChecked",
+    checkedAt: "",
+    remediation: null
+  },
+  modelStatus: []
+};
 
 function App() {
   const [draft, setDraft] = useState("");
   const [history, setHistory] = useState<TranscriptMessage[]>([]);
-  const [status, setStatus] = useState("M0 local bus ready");
-  const [companionStatus, setCompanionStatus] = useState<CompanionStatus>({
-    companionId: "not loaded",
-    saoBacklog: 0,
-    policyVersion: 1,
-    memoryCount: 0,
-    security: {
-      constitutionalIntegrity: "notChecked",
-      checkedAt: "",
-      remediation: null
-    },
-    modelStatus: []
-  });
+  const [status, setStatus] = useState("M0 entity bus ready");
+  const [companionStatus, setCompanionStatus] =
+    useState<CompanionStatusReport>(EMPTY_STATUS);
   const [error, setError] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -157,6 +134,42 @@ function App() {
         }
       })
       .catch((cause) => setSyncStatus(`SAO status unavailable: ${String(cause)}`));
+
+    invoke<CompanionStatusReport>("companion_status")
+      .then(setCompanionStatus)
+      .catch(() => {
+        // Non-fatal: status will populate after the first ego.action event.
+      });
+  }, []);
+
+  // Subscribe to `orion://ego.action` once at mount. This is the architectural
+  // inversion: chat output flows through the bus, not through a command return.
+  useEffect(() => {
+    const unlistenPromise = listen<EgoActionEvent>("orion://ego.action", (event) => {
+      const payload = event.payload;
+      setHistory((current) => [
+        ...current,
+        {
+          id: `${payload.correlationId ?? crypto.randomUUID()}-orion`,
+          role: "orion",
+          text: payload.responseText,
+          topic: "ego.action",
+          correlationId: payload.correlationId ?? "(unlinked)"
+        }
+      ]);
+      setIsSending(false);
+
+      // Refresh persistence-derived status after each ego response.
+      invoke<CompanionStatusReport>("companion_status")
+        .then(setCompanionStatus)
+        .catch(() => {
+          // Non-fatal.
+        });
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+    };
   }, []);
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
@@ -173,39 +186,23 @@ function App() {
     setStatus("Curator, Id, and Ego are processing locally");
 
     try {
-      const exchange = await invoke<ChatExchange>("send_chat_message", { text });
+      const ack = await invoke<ChatAck>("send_chat_message", { text });
+      // Append the user message immediately. The orion reply arrives later
+      // via the `orion://ego.action` event listener registered above.
       setHistory((current) => [
         ...current,
         {
-          id: exchange.input.id,
+          id: `${ack.correlationId}-user`,
           role: "user",
-          text: payloadText(exchange.input),
-          topic: exchange.input.topic,
-          correlationId: exchange.input.correlationId
-        },
-        {
-          id: exchange.output.id,
-          role: "orion",
-          text: payloadText(exchange.output),
-          topic: exchange.output.topic,
-          correlationId: exchange.output.correlationId
+          text,
+          topic: "mentor.input",
+          correlationId: ack.correlationId
         }
       ]);
-      setCompanionStatus({
-        companionId: exchange.companionId,
-        saoBacklog: exchange.saoBacklog,
-        policyVersion: exchange.policyVersion,
-        memoryCount: exchange.memoryCount,
-        security: exchange.security
-        ,
-        modelStatus: exchange.modelStatus
-      });
-      setStatus(`${exchange.persistedMessages} durable messages; SAO backlog ${exchange.saoBacklog}`);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
       setStatus("Local round-trip failed");
-    } finally {
       setIsSending(false);
     }
   }
@@ -294,8 +291,8 @@ function App() {
           <p className="eyebrow">Phoenix Project</p>
           <h1>OrionII</h1>
           <p className="lede">
-            Local-first companion runtime with durable identity, bicameral message
-            boundaries, and asynchronous SAO accountability.
+            Local-first companion runtime with durable identity, an entity-internal
+            event bus, and asynchronous SAO accountability over a sanitized seam.
           </p>
         </div>
         <div className="status-card">
@@ -440,7 +437,7 @@ function App() {
   );
 }
 
-function modelSummary(statuses: ChatExchange["modelStatus"]): string {
+function modelSummary(statuses: ModelStatus[]): string {
   if (statuses.length === 0) {
     return "not checked";
   }

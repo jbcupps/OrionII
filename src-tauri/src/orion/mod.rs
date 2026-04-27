@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod bus;
 pub mod curator;
 pub mod ego;
+pub mod egress;
 pub mod ethics;
 pub mod id;
 pub mod identity;
@@ -14,6 +15,7 @@ pub mod sao;
 pub mod security;
 pub mod service;
 pub mod skills;
+pub mod superego_local;
 pub mod topics;
 
 pub use service::{ChatExchange, OrionCore};
