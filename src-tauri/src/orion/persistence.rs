@@ -8,9 +8,16 @@ use thiserror::Error;
 use crate::orion::identity::IdentityState;
 use crate::orion::memory::{DocumentChunk, MemoryRecord};
 use crate::orion::message::Message;
-use crate::orion::sao::{PolicyOverlay, SaoClientConfig, SaoEgressRecord, SaoShipper, ShipReport};
+use crate::orion::sao::{PolicyOverlay, SaoEgressRecord, SaoEgressState};
 
+/// `Persistence` owns disk state — identity, messages, memories, document
+/// chunks, and the SAO egress queue. It does **not** do HTTP. The SAO
+/// shipping HTTP call lives in `egress::handle_outbound` (see ADR-001 §
+/// "egress.outbound seam"). This trait used to expose `ship_sao_egress`;
+/// that method moved out in Phase 2a so `egress.rs` is the only file that
+/// touches `SaoShipper`.
 pub trait Persistence {
+    #[allow(dead_code)]
     fn record_message(&mut self, message: &Message) -> Result<(), PersistenceError>;
     fn message_count(&self) -> usize;
     fn identity(&self) -> &IdentityState;
@@ -20,10 +27,16 @@ pub trait Persistence {
     fn enqueue_sao(&mut self, record: SaoEgressRecord) -> Result<(), PersistenceError>;
     fn sao_backlog_len(&self) -> usize;
     fn add_document_chunks(&mut self, chunks: Vec<DocumentChunk>) -> Result<(), PersistenceError>;
-    fn ship_sao_egress(
+
+    /// Egress-side hooks: take the pending records out for shipping, then
+    /// re-merge results back. The HTTP call itself happens in
+    /// `egress::handle_outbound`, not here.
+    fn take_pending_egress(&mut self) -> Vec<SaoEgressRecord>;
+    fn merge_egress_results(
         &mut self,
-        config: Option<&SaoClientConfig>,
-    ) -> Result<ShipReport, PersistenceError>;
+        records: Vec<SaoEgressRecord>,
+    ) -> Result<(), PersistenceError>;
+
     fn apply_sao_refresh(
         &mut self,
         remote_memories: Vec<MemoryRecord>,
@@ -190,23 +203,38 @@ impl Persistence for FilePersistence {
         self.flush()
     }
 
-    fn ship_sao_egress(
-        &mut self,
-        config: Option<&SaoClientConfig>,
-    ) -> Result<ShipReport, PersistenceError> {
-        let shipper = match config {
-            Some(c) => SaoShipper::with_config(Some(c.clone())),
-            None => SaoShipper::default(),
-        };
-        let report = shipper.ship_pending(
-            &mut self.state.sao_egress,
-            self.state.identity.identity.orion_id,
-        );
+    /// Take the pending egress records out for shipping. Caller (the egress
+    /// subscriber) runs them through `SaoShipper` and returns the updated
+    /// records via `merge_egress_results`.
+    fn take_pending_egress(&mut self) -> Vec<SaoEgressRecord> {
         self.state
             .sao_egress
-            .retain(|record| !matches!(record.state, crate::orion::sao::SaoEgressState::Acked));
-        self.flush()?;
-        Ok(report)
+            .iter()
+            .filter(|r| matches!(r.state, SaoEgressState::Pending))
+            .cloned()
+            .collect()
+    }
+
+    /// Merge the post-ship records back into the queue, then drop anything
+    /// that's been Acked. Failures stay Pending for the next attempt.
+    fn merge_egress_results(
+        &mut self,
+        records: Vec<SaoEgressRecord>,
+    ) -> Result<(), PersistenceError> {
+        for updated in records {
+            if let Some(slot) = self
+                .state
+                .sao_egress
+                .iter_mut()
+                .find(|r| r.id == updated.id)
+            {
+                *slot = updated;
+            }
+        }
+        self.state
+            .sao_egress
+            .retain(|record| !matches!(record.state, SaoEgressState::Acked));
+        self.flush()
     }
 
     fn apply_sao_refresh(
@@ -263,7 +291,7 @@ mod tests {
         let message = Message::new(
             MessageKind::UserInput,
             Author::User,
-            topics::USER_CHAT_INPUT,
+            topics::MENTOR_INPUT,
             Priority::UserInput,
             Uuid::new_v4(),
             Uuid::new_v4(),

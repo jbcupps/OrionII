@@ -1,6 +1,9 @@
 node_modules/
 dist/
 src-tauri/target/
+.sidecars/
+src-tauri/binaries/*.exe
+.orionii/
 
 # Logs and temporary files
 *.log

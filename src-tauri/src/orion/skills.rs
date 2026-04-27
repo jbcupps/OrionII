@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::orion::memory::DocumentChunk;
-use crate::orion::message::{Author, Message, MessageKind, Payload, Priority};
-use crate::orion::topics;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +19,7 @@ impl SkillAuthorization {
         }
     }
 
+    #[allow(dead_code)]
     pub fn local_os(skill_name: impl Into<String>, scopes: Vec<String>) -> Self {
         Self {
             skill_name: skill_name.into(),
@@ -71,10 +69,12 @@ impl DocumentSkill {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct OutlookSkill;
 
 impl OutlookSkill {
+    #[allow(dead_code)]
     pub fn authorization(&self) -> SkillAuthorization {
         SkillAuthorization::local_os(
             "outlook",
@@ -84,27 +84,10 @@ impl OutlookSkill {
             ],
         )
     }
-
-    pub fn search_task(
-        &self,
-        session_id: Uuid,
-        correlation_id: Uuid,
-        parent_msg_id: Uuid,
-        query: &str,
-    ) -> Message {
-        Message::new(
-            MessageKind::AgentAssigned,
-            Author::Ego,
-            topics::AGENT_TASK_ASSIGNED,
-            Priority::UserInput,
-            session_id,
-            correlation_id,
-            Some(parent_msg_id),
-            Payload::AgentTask {
-                description: format!("Search local Outlook data for '{}'", query),
-            },
-        )
-    }
+    // Note: the previous `search_task` helper was removed when the bus
+    // refactor dropped the AGENT_TASK_* topics. When the agent-task
+    // feature re-lands it must come back as an ADR-gated topic addition
+    // (see ADR-001) plus a bus subscriber, not a `Message` constructor.
 }
 
 #[derive(Default)]
@@ -117,6 +100,7 @@ impl OAuthSkillCatalog {
         self.skills.push(skill);
     }
 
+    #[allow(dead_code)]
     pub fn scopes_for(&self, skill_name: &str) -> Option<&[String]> {
         self.skills
             .iter()

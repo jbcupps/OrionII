@@ -1,21 +1,32 @@
+use std::sync::{Arc, Mutex};
+
 use serde::Serialize;
+use serde_json::json;
+use tauri::async_runtime::JoinHandle;
+use tauri::{AppHandle, Emitter};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::orion::birth::BirthResponse;
-use crate::orion::bootstrap::OrionBootstrap;
-use crate::orion::bus::{BusError, InProcessBus, LocalBus};
-use crate::orion::curator::CuratorRuntime;
-use crate::orion::ego::EgoRuntime;
-use crate::orion::message::{Author, Message, MessageKind, Payload, Priority};
-use crate::orion::model::{ModelCallStatus, ModelRouter};
+use crate::orion::bootstrap::{BusTransport, OrionBootstrap};
+use crate::orion::bus::{
+    current_soul_ref, BusError, Envelope, IggyBus, InMemoryBus, NatsJetStreamBus, RecvError,
+    SharedBus, Topic,
+};
+use crate::orion::iggy_auth;
+use crate::orion::iggy_supervisor::IggySupervisor;
 #[cfg(test)]
-use crate::orion::model::{ModelConfig, ModelProviderKind};
+use crate::orion::model::ModelConfig;
+use crate::orion::model::{ModelCallStatus, ModelProviderKind, ModelRouter};
+use crate::orion::nats_supervisor::NatsSupervisor;
+use crate::orion::payloads::EgoActionPayload;
 use crate::orion::persistence::{FilePersistence, Persistence, PersistenceError};
-use crate::orion::sao::{self, SaoClientConfig, SaoClientError, SaoEgressRecord, SaoEvent, SaoShipper};
+use crate::orion::sao::{SaoClientConfig, SaoClientError, SaoPolicyClient, ShipReport};
 use crate::orion::security::{ConstitutionalVerifier, SecurityHealth};
-use crate::orion::skills::{DocumentSkill, OAuthSkillCatalog, OutlookSkill, SkillAuthorization};
-use crate::orion::topics;
+use crate::orion::skills::{DocumentSkill, OAuthSkillCatalog, SkillAuthorization};
+use crate::orion::{ego, egress, id, superego_local};
+
+const UI_EGO_ACTION_EVENT: &str = "orion://ego/action";
 
 #[derive(Debug, Error)]
 pub enum OrionError {
@@ -29,15 +40,23 @@ pub enum OrionError {
     SaoClient(#[from] SaoClientError),
 }
 
+/// Acknowledgement returned by the `send_chat_message` Tauri command after
+/// the bus refactor. The actual ego response arrives asynchronously on the
+/// `orion://ego/action` Tauri event.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatExchange {
-    pub input: Message,
-    pub id_signal: Message,
-    pub instruction: Message,
-    pub output: Message,
-    pub persisted_messages: usize,
+    pub correlation_id: Uuid,
+    pub accepted: bool,
+}
+
+/// Persistence-derived companion status. The UI fetches this via the
+/// `companion_status` command after each ego.action event lands.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanionStatusReport {
     pub companion_id: Uuid,
+    pub persisted_messages: usize,
     pub sao_backlog: usize,
     pub policy_version: u64,
     pub memory_count: usize,
@@ -46,27 +65,49 @@ pub struct ChatExchange {
 }
 
 pub struct OrionCore {
-    bus: InProcessBus,
-    persistence: FilePersistence,
-    curator: CuratorRuntime,
-    ego: EgoRuntime,
-    model: ModelRouter,
+    bus: SharedBus,
+    persistence: Arc<Mutex<FilePersistence>>,
+    model: Arc<ModelRouter>,
     documents: DocumentSkill,
-    outlook: OutlookSkill,
+    #[allow(dead_code)]
     oauth_catalog: OAuthSkillCatalog,
     verifier: ConstitutionalVerifier,
     sao_config: Option<SaoClientConfig>,
     birth: Option<BirthResponse>,
+    birth_error: Option<String>,
+    bus_transport: BusTransport,
+    /// Held to abort subscriber tasks when this `OrionCore` is dropped
+    /// (e.g. on `apply_bundle_config` hot-swap). Subscribers that observe
+    /// `RecvError::Closed` will exit cleanly on their own once the bus's
+    /// final `Arc` reference is released, but explicit `abort()` here makes
+    /// shutdown deterministic.
+    handles: Vec<JoinHandle<()>>,
+    /// Phase 2b: live iggy-server sidecar when running on the
+    /// `BundledIggy` transport. Held so its `Drop` SIGKILLs the child on
+    /// hot-swap or app shutdown.
+    #[allow(dead_code)]
+    iggy_supervisor: Option<IggySupervisor>,
+    /// Product durable bus sidecar. Held so Drop terminates the local
+    /// nats-server child on hot-swap or app shutdown.
+    #[allow(dead_code)]
+    nats_supervisor: Option<NatsSupervisor>,
 }
 
 impl Default for OrionCore {
     fn default() -> Self {
-        Self::from_bootstrap(OrionBootstrap::load())
+        // Sync default kept for legacy callers. Drives the async load + build
+        // path via tauri's runtime.
+        tauri::async_runtime::block_on(async {
+            let bootstrap = OrionBootstrap::load().await;
+            Self::build_async(bootstrap, None).await
+        })
     }
 }
 
 impl OrionCore {
-    pub fn from_bootstrap(bootstrap: OrionBootstrap) -> Self {
+    /// Async constructor. Phase 2a: in-memory bus, no awaits actually fire.
+    /// Phase 2b will add the Iggy connect path that does .await here.
+    pub async fn build_async(bootstrap: OrionBootstrap, app: Option<AppHandle>) -> Self {
         let mut oauth_catalog = OAuthSkillCatalog::default();
         oauth_catalog.register(SkillAuthorization::oauth(
             "external-documents",
@@ -83,46 +124,113 @@ impl OrionCore {
             }
             None => FilePersistence::default(),
         };
+        let persistence = Arc::new(Mutex::new(persistence));
 
         let model = match (&bootstrap.sao, bootstrap.model.provider.clone()) {
-            (Some(sao), crate::orion::model::ModelProviderKind::SaoProxyWithFallback) => {
-                ModelRouter::with_sao_proxy(bootstrap.model.clone(), sao.clone())
-            }
-            _ => ModelRouter::new(bootstrap.model.clone()),
+            (Some(sao), ModelProviderKind::SaoProxyWithFallback) => Arc::new(
+                ModelRouter::with_sao_proxy(bootstrap.model.clone(), sao.clone()),
+            ),
+            _ => Arc::new(ModelRouter::new(bootstrap.model.clone())),
         };
 
+        // Bus selection. The `EventBus` trait abstracts every transport;
+        // subscribers below don't change shape between them. Any failure
+        // in a durable broker path falls back to the in-memory bus with a
+        // diagnostic log — the entity stays alive even if the broker
+        // doesn't.
+        let (orion_id, supervisor_soul_ref) = {
+            let p = persistence.lock().expect("persistence mutex poisoned");
+            let identity = p.identity();
+            (identity.identity.orion_id, current_soul_ref(identity))
+        };
+
+        let BusSelection {
+            bus,
+            iggy_supervisor,
+            nats_supervisor,
+        } = match select_bus(&bootstrap.bus_transport, orion_id, supervisor_soul_ref).await {
+            Ok(selection) => selection,
+            Err(error) => {
+                eprintln!(
+                    "[orion-core] durable bus path failed: {error}; falling back to in-memory"
+                );
+                BusSelection::in_memory()
+            }
+        };
+
+        let mut handles = vec![
+            id::spawn(bus.clone(), persistence.clone(), model.clone()),
+            ego::spawn(bus.clone(), model.clone()),
+            superego_local::spawn(bus.clone()),
+            egress::spawn(bus.clone(), persistence.clone(), bootstrap.sao.clone()),
+        ];
+        if let Some(app) = app {
+            handles.push(spawn_ui_emitter(bus.clone(), app));
+        }
+
         Self {
-            bus: InProcessBus::default(),
+            bus,
             persistence,
-            curator: CuratorRuntime::default(),
-            ego: EgoRuntime,
             model,
             documents: DocumentSkill,
-            outlook: OutlookSkill,
             oauth_catalog,
             verifier: ConstitutionalVerifier,
             sao_config: bootstrap.sao,
             birth: bootstrap.birth,
+            birth_error: bootstrap.birth_error,
+            bus_transport: bootstrap.bus_transport,
+            handles,
+            iggy_supervisor,
+            nats_supervisor,
         }
+    }
+
+    /// Sync wrapper that loads bootstrap + builds in a single block_on.
+    /// Prefer `build_async` from inside async code.
+    #[allow(dead_code)]
+    pub fn from_bootstrap_blocking() -> Self {
+        tauri::async_runtime::block_on(async {
+            let bootstrap = OrionBootstrap::load().await;
+            Self::build_async(bootstrap, None).await
+        })
+    }
+
+    pub fn from_bootstrap_with_app_blocking(app: AppHandle) -> Self {
+        tauri::async_runtime::block_on(async {
+            let bootstrap = OrionBootstrap::load().await;
+            Self::build_async(bootstrap, Some(app)).await
+        })
     }
 
     #[cfg(test)]
     pub fn with_persistence(persistence: FilePersistence) -> Self {
+        let persistence = Arc::new(Mutex::new(persistence));
+        let model = Arc::new(ModelRouter::new(ModelConfig {
+            provider: ModelProviderKind::Deterministic,
+            ..ModelConfig::default()
+        }));
+        let bus: SharedBus = InMemoryBus::new();
+
+        let handles = vec![
+            id::spawn(bus.clone(), persistence.clone(), model.clone()),
+            ego::spawn(bus.clone(), model.clone()),
+            superego_local::spawn(bus.clone()),
+        ];
+
         Self {
-            bus: InProcessBus::default(),
+            bus,
             persistence,
-            curator: CuratorRuntime::default(),
-            ego: EgoRuntime,
-            model: ModelRouter::new(ModelConfig {
-                provider: ModelProviderKind::Deterministic,
-                ..ModelConfig::default()
-            }),
+            model,
             documents: DocumentSkill,
-            outlook: OutlookSkill,
             oauth_catalog: OAuthSkillCatalog::default(),
             verifier: ConstitutionalVerifier,
             sao_config: None,
             birth: None,
+            birth_error: None,
+            bus_transport: BusTransport::InMemory,
+            handles,
+            iggy_supervisor: None,
+            nats_supervisor: None,
         }
     }
 
@@ -130,154 +238,64 @@ impl OrionCore {
         self.birth.as_ref()
     }
 
-    pub fn send_chat_message(&mut self, text: String) -> Result<ChatExchange, OrionError> {
-        let text = text.trim();
+    pub fn birth_error(&self) -> Option<&str> {
+        self.birth_error.as_deref()
+    }
 
-        if text.is_empty() {
+    /// Publish a `MentorInput` envelope and return immediately. The Ego
+    /// response arrives later as a Tauri event — see ADR-001 § "UI
+    /// inversion".
+    pub async fn send_chat_message(&self, text: String) -> Result<ChatExchange, OrionError> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
             return Err(OrionError::EmptyMessage);
         }
 
-        self.model.clear_statuses();
-
-        let session_id = Uuid::new_v4();
         let correlation_id = Uuid::new_v4();
-        let input = Message::new(
-            MessageKind::UserInput,
-            Author::User,
-            topics::USER_CHAT_INPUT,
-            Priority::UserInput,
-            session_id,
-            correlation_id,
-            None,
-            Payload::UserInput {
-                text: text.to_string(),
-            },
+        let (agent_id, soul_ref) = {
+            let p = self.persistence.lock().expect("persistence mutex poisoned");
+            let identity = p.identity();
+            (
+                identity.identity.orion_id.to_string(),
+                current_soul_ref(identity),
+            )
+        };
+
+        let payload = json!({ "text": trimmed });
+        let env = Envelope::new(
+            Topic::MentorInput,
+            agent_id,
+            soul_ref,
+            Some(correlation_id),
+            payload,
         );
-
-        self.publish_and_record(input.clone())?;
-
-        let document_context = self
-            .curator
-            .retrieve_documents(text, self.persistence.document_chunks());
-        let curated = self.curator.curate(
-            &input,
-            self.persistence.identity(),
-            &document_context,
-            &self.model,
-        );
-        let id_signal = Message::new(
-            MessageKind::IdSignal,
-            Author::Id,
-            topics::EGO_INSTRUCTIONS,
-            Priority::UserInput,
-            input.session_id,
-            input.correlation_id,
-            Some(input.id),
-            Payload::IdSignal {
-                identity_version: curated.id_signal.identity_version,
-                personality_signal: curated.id_signal.personality_signal.clone(),
-                drives: curated.id_signal.drives.clone(),
-            },
-        );
-        self.publish_and_record(id_signal.clone())?;
-
-        let instruction = curated.instruction;
-        self.publish_and_record(instruction.clone())?;
-
-        if text.to_lowercase().contains("outlook") {
-            let authorization = self.outlook.authorization();
-            let task = self.outlook.search_task(
-                input.session_id,
-                input.correlation_id,
-                instruction.id,
-                text,
-            );
-            self.publish_and_record(task)?;
-            let audit = sao::audit_message(
-                input.session_id,
-                input.correlation_id,
-                instruction.id,
-                format!(
-                    "authorized {} with scopes {}",
-                    authorization.skill_name,
-                    authorization.scopes.join(",")
-                ),
-            );
-            self.publish_and_record(audit)?;
-        }
-
-        if self
-            .oauth_catalog
-            .scopes_for("external-documents")
-            .is_some()
-        {
-            let audit = sao::audit_message(
-                input.session_id,
-                input.correlation_id,
-                instruction.id,
-                "external-documents OAuth scope available: documents.read",
-            );
-            self.publish_and_record(audit)?;
-        }
-
-        let output = self.ego.respond(&instruction, &curated.ethics, &self.model);
-        self.publish_and_record(output.clone())?;
-        debug_assert!(topics::ALL_TOPICS.contains(&output.topic.as_str()));
-        let _output_topic_messages = self.bus.messages_for_topic(topics::USER_CHAT_OUTPUT);
-        let _replayed_messages = self.bus.replay_since(0);
-
-        let audit = sao::audit_message(
-            output.session_id,
-            output.correlation_id,
-            output.id,
-            format!(
-                "ego responded to user chat with {} local messages",
-                self.bus.len()
-            ),
-        );
-        self.publish_and_record(audit)?;
-
-        self.persistence.enqueue_sao(SaoEgressRecord::pending(
-            SaoEvent::IdentitySync {
-                orion_id: self.persistence.identity().identity.orion_id,
-                version: self.persistence.identity().version,
-            }
-            .sanitized(),
-        ))?;
-        let security = self.verifier.verify("local constitutional scaffold", None);
+        self.bus.publish(env).await?;
 
         Ok(ChatExchange {
-            input,
-            id_signal,
-            instruction,
-            output,
-            persisted_messages: self.persistence.message_count(),
-            companion_id: self.persistence.identity().identity.orion_id,
-            sao_backlog: self.persistence.sao_backlog_len(),
-            policy_version: self.persistence.policy().version,
-            memory_count: self.persistence.memories().len(),
-            security,
-            model_status: self.model.statuses(),
+            correlation_id,
+            accepted: true,
         })
     }
 
     pub fn index_document(
-        &mut self,
+        &self,
         source_path: String,
         contents: String,
     ) -> Result<usize, OrionError> {
         let chunks = self.documents.chunk_document(source_path, &contents);
         let count = chunks.len();
-        self.persistence.add_document_chunks(chunks)?;
+        let mut p = self.persistence.lock().expect("persistence mutex poisoned");
+        p.add_document_chunks(chunks)?;
         Ok(count)
     }
 
-    pub fn apply_sao_policy_refresh(&mut self, rules: Vec<String>) -> Result<u64, OrionError> {
-        let shipper = SaoShipper::with_config(self.sao_config.clone());
-        let policy = match shipper.fetch_policy() {
+    pub async fn apply_sao_policy_refresh(&self, rules: Vec<String>) -> Result<u64, OrionError> {
+        let policy_client = SaoPolicyClient::with_config(self.sao_config.clone());
+        let policy = match policy_client.fetch_policy().await {
             Ok(policy) => policy,
             Err(SaoClientError::NotConfigured) => {
-                let current = self.persistence.policy();
+                let p = self.persistence.lock().expect("persistence mutex poisoned");
+                let current = p.policy();
                 crate::orion::sao::PolicyOverlay {
                     version: current.version + 1,
                     source: "local-fallback".to_string(),
@@ -287,92 +305,304 @@ impl OrionCore {
             }
             Err(error) => return Err(error.into()),
         };
-        self.persistence.apply_sao_refresh(Vec::new(), policy)?;
-        Ok(self.persistence.policy().version)
+        let mut p = self.persistence.lock().expect("persistence mutex poisoned");
+        p.apply_sao_refresh(Vec::new(), policy)?;
+        Ok(p.policy().version)
     }
 
-    pub fn ship_sao_egress(&mut self) -> Result<crate::orion::sao::ShipReport, OrionError> {
-        Ok(self.persistence.ship_sao_egress(self.sao_config.as_ref())?)
+    /// User-triggered ship of any pending SAO egress backlog. Same take /
+    /// ship / merge dance as `egress::handle_outbound`, just exposed as a
+    /// command so the UI can flush the queue manually.
+    pub async fn ship_sao_egress(&self) -> Result<ShipReport, OrionError> {
+        Ok(egress::ship_pending_backlog(&self.persistence, self.sao_config.clone()).await?)
     }
 
     pub fn sao_config(&self) -> Option<&SaoClientConfig> {
         self.sao_config.as_ref()
     }
 
-    fn publish_and_record(&mut self, message: Message) -> Result<(), OrionError> {
-        self.bus.publish(message.clone())?;
+    pub fn bus_transport_label(&self) -> &'static str {
+        self.bus_transport.as_label()
+    }
 
-        if let Payload::AuditEvent { action, .. } = &message.payload {
-            self.persistence.enqueue_sao(SaoEgressRecord::pending(
-                SaoEvent::AuditAction {
-                    action: action.clone(),
-                    correlation_id: message.correlation_id,
-                }
-                .sanitized(),
-            ))?;
+    /// Returns the iggy-server endpoint when running on the
+    /// `BundledIggy` transport; `None` otherwise. Used by the
+    /// `rotate_iggy_token` command.
+    pub fn iggy_endpoint(&self) -> Option<String> {
+        self.iggy_supervisor
+            .as_ref()
+            .map(|s| s.endpoint().to_string())
+    }
+
+    pub fn companion_status(&self) -> CompanionStatusReport {
+        let p = self.persistence.lock().expect("persistence mutex poisoned");
+        let security = self.verifier.verify("local constitutional scaffold", None);
+        CompanionStatusReport {
+            companion_id: p.identity().identity.orion_id,
+            persisted_messages: p.message_count(),
+            sao_backlog: p.sao_backlog_len(),
+            policy_version: p.policy().version,
+            memory_count: p.memories().len(),
+            security,
+            model_status: self.model.statuses(),
+        }
+    }
+}
+
+impl Drop for OrionCore {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+/// UI emitter subscriber. Listens on `Topic::EgoAction` and forwards each
+/// envelope to the React app via a Tauri event. This is the only
+/// Rust→React bridge for chat output — the UI does not consume the
+/// `send_chat_message` return value for the assistant reply.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiEgoActionEvent {
+    correlation_id: Option<Uuid>,
+    user_query: String,
+    response_text: String,
+}
+
+struct BusSelection {
+    bus: SharedBus,
+    iggy_supervisor: Option<IggySupervisor>,
+    nats_supervisor: Option<NatsSupervisor>,
+}
+
+impl BusSelection {
+    fn in_memory() -> Self {
+        Self {
+            bus: InMemoryBus::new(),
+            iggy_supervisor: None,
+            nats_supervisor: None,
+        }
+    }
+}
+
+/// Resolve which bus transport to construct. Returns the bus + any owned
+/// sidecar supervisor handle. Errors here are non-fatal: the caller falls
+/// back to in-memory and continues.
+async fn select_bus(
+    transport: &BusTransport,
+    orion_id: Uuid,
+    supervisor_soul_ref: String,
+) -> Result<BusSelection, String> {
+    match transport {
+        BusTransport::InMemory => Ok(BusSelection::in_memory()),
+
+        BusTransport::NatsJetStream { port } => {
+            let supervisor_bus: SharedBus = InMemoryBus::new();
+            let supervisor = NatsSupervisor::start(*port, supervisor_bus, supervisor_soul_ref)
+                .await
+                .map_err(|e| format!("nats supervisor start: {e}"))?;
+            let nats_bus = NatsJetStreamBus::connect(supervisor.endpoint(), orion_id)
+                .await
+                .map_err(|e| format!("nats connect: {e}"))?;
+            Ok(BusSelection {
+                bus: nats_bus as SharedBus,
+                iggy_supervisor: None,
+                nats_supervisor: Some(supervisor),
+            })
         }
 
-        self.persistence.record_message(&message)?;
-        Ok(())
+        BusTransport::ExternalNatsJetStream { endpoint } => {
+            let nats_bus = NatsJetStreamBus::connect(endpoint, orion_id)
+                .await
+                .map_err(|e| format!("external nats connect: {e}"))?;
+            Ok(BusSelection {
+                bus: nats_bus as SharedBus,
+                iggy_supervisor: None,
+                nats_supervisor: None,
+            })
+        }
+
+        BusTransport::BundledIggy { port } => {
+            // The supervisor needs a SharedBus to publish broker-unstable
+            // governance into. We give it a temporary in-memory bus
+            // initially, then construct the real IggyBus and let the
+            // supervisor watcher continue using its temp handle. The
+            // governance envelope is informational only at this point —
+            // future Phase 2.1 will plumb the real bus through to the
+            // supervisor after IggyBus is built.
+            let supervisor_bus: SharedBus = InMemoryBus::new();
+            let supervisor = IggySupervisor::start(*port, supervisor_bus, supervisor_soul_ref)
+                .await
+                .map_err(|e| format!("supervisor start: {e}"))?;
+            let endpoint_no_scheme = supervisor
+                .endpoint()
+                .trim_start_matches("tcp://")
+                .to_string();
+            let creds = load_or_provision_creds(supervisor.endpoint()).await;
+            let (user, pass) = parse_pat(&creds.pat);
+            let iggy_bus = IggyBus::connect(&endpoint_no_scheme, &user, &pass, orion_id)
+                .await
+                .map_err(|e| format!("iggy connect: {e}"))?;
+            Ok(BusSelection {
+                bus: iggy_bus as SharedBus,
+                iggy_supervisor: Some(supervisor),
+                nats_supervisor: None,
+            })
+        }
+
+        BusTransport::ExternalIggy { endpoint, pat } => {
+            let endpoint_no_scheme = endpoint.trim_start_matches("tcp://").to_string();
+            let (user, pass) = parse_pat(pat);
+            let iggy_bus = IggyBus::connect(&endpoint_no_scheme, &user, &pass, orion_id)
+                .await
+                .map_err(|e| format!("external iggy connect: {e}"))?;
+            Ok(BusSelection {
+                bus: iggy_bus as SharedBus,
+                iggy_supervisor: None,
+                nats_supervisor: None,
+            })
+        }
     }
+}
+
+/// Phase 2b PAT format: `username:password` until the real PAT-mint flow
+/// in `iggy_auth` lands. The split-at-`:` parser falls back to bootstrap
+/// credentials if the format is unrecognised. See ADR-002 § "PAT auth".
+fn parse_pat(pat: &str) -> (String, String) {
+    if let Some((user, pass)) = pat.split_once(':') {
+        (user.to_string(), pass.to_string())
+    } else {
+        // Treat the whole string as a token; iggy bootstrap admin
+        // user/pass is the documented default.
+        ("iggy".to_string(), "iggy".to_string())
+    }
+}
+
+async fn load_or_provision_creds(endpoint: &str) -> iggy_auth::IggyCredentials {
+    let path = match iggy_auth::pat_store_path() {
+        Ok(p) => p,
+        Err(error) => {
+            eprintln!(
+                "[orion-core] could not resolve PAT store path: {error}; using bootstrap creds"
+            );
+            return iggy_auth::IggyCredentials {
+                endpoint: endpoint.to_string(),
+                pat: "iggy:iggy".to_string(),
+            };
+        }
+    };
+    match iggy_auth::load(&path) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            let provisioned = iggy_auth::provision_first_run(endpoint).await.ok();
+            if let Some(c) = &provisioned {
+                let _ = iggy_auth::save(&path, c);
+            }
+            provisioned.unwrap_or_else(|| iggy_auth::IggyCredentials {
+                endpoint: endpoint.to_string(),
+                pat: "iggy:iggy".to_string(),
+            })
+        }
+        Err(error) => {
+            eprintln!("[orion-core] PAT store load failed: {error}; using bootstrap creds");
+            iggy_auth::IggyCredentials {
+                endpoint: endpoint.to_string(),
+                pat: "iggy:iggy".to_string(),
+            }
+        }
+    }
+}
+
+fn spawn_ui_emitter(bus: SharedBus, app: AppHandle) -> JoinHandle<()> {
+    let mut rx = bus.subscribe(Topic::EgoAction);
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(env) => {
+                    let Ok(action) =
+                        serde_json::from_value::<EgoActionPayload>(env.payload.clone())
+                    else {
+                        eprintln!("[ui-emitter] dropped malformed EgoAction payload");
+                        continue;
+                    };
+                    let event = UiEgoActionEvent {
+                        correlation_id: env.correlation_id,
+                        user_query: action.user_query,
+                        response_text: action.response_text,
+                    };
+                    if let Err(error) = app.emit(UI_EGO_ACTION_EVENT, &event) {
+                        eprintln!("[ui-emitter] failed to emit Tauri event: {error}");
+                    }
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    eprintln!("[ui-emitter] lagged on EgoAction, skipped {skipped}");
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
-
     use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
-    fn chat_preserves_causality_and_enqueues_sao() {
-        let dir = std::env::temp_dir().join(format!("orionii-test-{}", Uuid::new_v4()));
-        let persistence = FilePersistence::open(&dir).unwrap();
-        let mut core = OrionCore::with_persistence(persistence);
-
-        let exchange = core
-            .send_chat_message("Help me plan the day".to_string())
-            .unwrap();
-
-        assert_eq!(
-            exchange.input.correlation_id,
-            exchange.id_signal.correlation_id
-        );
-        assert_eq!(
-            exchange.input.correlation_id,
-            exchange.instruction.correlation_id
-        );
-        assert_eq!(
-            exchange.input.correlation_id,
-            exchange.output.correlation_id
-        );
-        assert!(exchange.persisted_messages >= 5);
-        assert!(exchange.sao_backlog >= 2);
-
-        let _ = std::fs::remove_dir_all(dir);
+    fn ui_ego_action_event_name_uses_tauri_safe_chars() {
+        assert!(UI_EGO_ACTION_EVENT
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '/' | ':' | '_')));
     }
 
-    #[test]
-    fn indexed_documents_are_used_as_local_context() {
+    /// End-to-end smoke test: publishing a `MentorInput` results in an
+    /// `EgoAction` arriving on the bus with a non-empty response text and
+    /// a non-empty soul_ref. The deterministic model provider keeps this
+    /// hermetic — no Ollama, no SAO required.
+    ///
+    /// Was `#[ignore]`d in Phase 1 because of `reqwest::blocking`'s nested
+    /// runtime panicking on drop inside an async context. Phase 2a's async
+    /// model layer removes that — there is no longer a nested runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mentor_input_round_trips_to_ego_action() {
         let dir = std::env::temp_dir().join(format!("orionii-test-{}", Uuid::new_v4()));
         let persistence = FilePersistence::open(&dir).unwrap();
-        let mut core = OrionCore::with_persistence(persistence);
+        let core = OrionCore::with_persistence(persistence);
 
-        core.index_document(
-            "worker-notes.md".to_string(),
-            "The quarterly review packet is stored in the blue folder.".to_string(),
-        )
-        .unwrap();
-        let exchange = core
-            .send_chat_message("Where is the quarterly review packet?".to_string())
+        let mut ego_rx = core.bus.subscribe(Topic::EgoAction);
+        let mut egress_rx = core.bus.subscribe(Topic::EgressOutbound);
+
+        let ack = core
+            .send_chat_message("Help me plan the day".to_string())
+            .await
             .unwrap();
+        assert!(ack.accepted);
 
-        match exchange.instruction.payload {
-            Payload::CuratedPrompt {
-                context_summary, ..
-            } => assert!(context_summary.contains("blue folder")),
-            _ => panic!("expected curated prompt"),
-        }
+        let env = timeout(Duration::from_secs(5), ego_rx.recv())
+            .await
+            .expect("EgoAction did not arrive within 5s")
+            .expect("recv error");
 
+        assert_eq!(env.topic, Topic::EgoAction);
+        assert_eq!(env.correlation_id, Some(ack.correlation_id));
+        assert!(!env.soul_ref.is_empty(), "soul_ref must be populated");
+
+        let payload: EgoActionPayload = serde_json::from_value(env.payload).unwrap();
+        assert!(!payload.response_text.is_empty());
+
+        let outbound = timeout(Duration::from_secs(5), egress_rx.recv())
+            .await
+            .expect("EgressOutbound did not arrive within 5s")
+            .expect("recv error");
+
+        assert_eq!(outbound.topic, Topic::EgressOutbound);
+        assert_eq!(outbound.correlation_id, Some(ack.correlation_id));
+        assert_eq!(outbound.soul_ref, env.soul_ref);
+        assert_eq!(outbound.payload["action"], Topic::EgoAction.as_str());
+        assert_eq!(outbound.payload["sourceTopic"], Topic::EgoAction.as_str());
+
+        drop(core);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

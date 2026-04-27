@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -17,14 +18,15 @@ pub struct ModelPrompt {
 
 pub type ModelResult<T> = Result<T, ModelError>;
 
-pub trait ModelProvider {
-    fn consult_id(
+#[async_trait]
+pub trait ModelProvider: Send + Sync {
+    async fn consult_id(
         &self,
         identity: &IdentityState,
         query: &str,
         context: &str,
     ) -> ModelResult<String>;
-    fn generate_ego_response(
+    async fn generate_ego_response(
         &self,
         prompt: &ModelPrompt,
         ethics: &EthicsOverlay,
@@ -113,8 +115,9 @@ pub struct ModelCallStatus {
 #[derive(Default)]
 pub struct DeterministicModelProvider;
 
+#[async_trait]
 impl ModelProvider for DeterministicModelProvider {
-    fn consult_id(
+    async fn consult_id(
         &self,
         identity: &IdentityState,
         query: &str,
@@ -129,7 +132,7 @@ impl ModelProvider for DeterministicModelProvider {
         ))
     }
 
-    fn generate_ego_response(
+    async fn generate_ego_response(
         &self,
         prompt: &ModelPrompt,
         ethics: &EthicsOverlay,
@@ -185,6 +188,7 @@ impl ModelRouter {
         &self.config
     }
 
+    #[allow(dead_code)]
     pub fn clear_statuses(&self) {
         if let Ok(mut statuses) = self.statuses.lock() {
             statuses.clear();
@@ -204,13 +208,16 @@ impl ModelRouter {
         }
     }
 
-    fn fallback_id(
+    async fn fallback_id(
         &self,
         identity: &IdentityState,
         query: &str,
         context: &str,
     ) -> ModelResult<String> {
-        let text = self.deterministic.consult_id(identity, query, context)?;
+        let text = self
+            .deterministic
+            .consult_id(identity, query, context)
+            .await?;
         self.record(ModelCallStatus {
             role: ModelRole::Id,
             provider: ModelProviderKind::Deterministic,
@@ -221,8 +228,15 @@ impl ModelRouter {
         Ok(text)
     }
 
-    fn fallback_ego(&self, prompt: &ModelPrompt, ethics: &EthicsOverlay) -> ModelResult<String> {
-        let text = self.deterministic.generate_ego_response(prompt, ethics)?;
+    async fn fallback_ego(
+        &self,
+        prompt: &ModelPrompt,
+        ethics: &EthicsOverlay,
+    ) -> ModelResult<String> {
+        let text = self
+            .deterministic
+            .generate_ego_response(prompt, ethics)
+            .await?;
         self.record(ModelCallStatus {
             role: ModelRole::Ego,
             provider: ModelProviderKind::Deterministic,
@@ -240,26 +254,24 @@ impl Default for ModelRouter {
     }
 }
 
+#[async_trait]
 impl ModelProvider for ModelRouter {
-    fn consult_id(
+    async fn consult_id(
         &self,
         identity: &IdentityState,
         query: &str,
         context: &str,
     ) -> ModelResult<String> {
         match self.config.provider {
-            ModelProviderKind::Deterministic => self.fallback_id(identity, query, context),
+            ModelProviderKind::Deterministic => self.fallback_id(identity, query, context).await,
             ModelProviderKind::SaoProxyWithFallback => {
                 let provider_kind = ModelProviderKind::SaoProxyWithFallback;
-                let result = self
-                    .sao_proxy
-                    .as_ref()
-                    .map(|p| p.consult_id(identity, query, context))
-                    .unwrap_or_else(|| {
-                        Err(ModelError::RuntimeUnavailable(
-                            "SAO proxy not initialized".to_string(),
-                        ))
-                    });
+                let result = match self.sao_proxy.as_ref() {
+                    Some(p) => p.consult_id(identity, query, context).await,
+                    None => Err(ModelError::RuntimeUnavailable(
+                        "SAO proxy not initialized".to_string(),
+                    )),
+                };
                 match result {
                     Ok(text) => {
                         self.record(ModelCallStatus {
@@ -279,53 +291,52 @@ impl ModelProvider for ModelRouter {
                             model: self.config.id_model.clone(),
                             message: Some(error.to_string()),
                         });
-                        self.fallback_id(identity, query, context)
+                        self.fallback_id(identity, query, context).await
                     }
                 }
             }
-            ModelProviderKind::OllamaWithFallback => match self.ollama.consult_id(identity, query, context) {
-                Ok(text) => {
-                    self.record(ModelCallStatus {
-                        role: ModelRole::Id,
-                        provider: ModelProviderKind::OllamaWithFallback,
-                        state: ModelCallState::Healthy,
-                        model: self.config.id_model.clone(),
-                        message: None,
-                    });
-                    Ok(text)
+            ModelProviderKind::OllamaWithFallback => {
+                match self.ollama.consult_id(identity, query, context).await {
+                    Ok(text) => {
+                        self.record(ModelCallStatus {
+                            role: ModelRole::Id,
+                            provider: ModelProviderKind::OllamaWithFallback,
+                            state: ModelCallState::Healthy,
+                            model: self.config.id_model.clone(),
+                            message: None,
+                        });
+                        Ok(text)
+                    }
+                    Err(error) => {
+                        self.record(ModelCallStatus {
+                            role: ModelRole::Id,
+                            provider: ModelProviderKind::OllamaWithFallback,
+                            state: ModelCallState::Degraded,
+                            model: self.config.id_model.clone(),
+                            message: Some(error.to_string()),
+                        });
+                        self.fallback_id(identity, query, context).await
+                    }
                 }
-                Err(error) => {
-                    self.record(ModelCallStatus {
-                        role: ModelRole::Id,
-                        provider: ModelProviderKind::OllamaWithFallback,
-                        state: ModelCallState::Degraded,
-                        model: self.config.id_model.clone(),
-                        message: Some(error.to_string()),
-                    });
-                    self.fallback_id(identity, query, context)
-                }
-            },
+            }
         }
     }
 
-    fn generate_ego_response(
+    async fn generate_ego_response(
         &self,
         prompt: &ModelPrompt,
         ethics: &EthicsOverlay,
     ) -> ModelResult<String> {
         match self.config.provider {
-            ModelProviderKind::Deterministic => self.fallback_ego(prompt, ethics),
+            ModelProviderKind::Deterministic => self.fallback_ego(prompt, ethics).await,
             ModelProviderKind::SaoProxyWithFallback => {
                 let provider_kind = ModelProviderKind::SaoProxyWithFallback;
-                let result = self
-                    .sao_proxy
-                    .as_ref()
-                    .map(|p| p.generate_ego_response(prompt, ethics))
-                    .unwrap_or_else(|| {
-                        Err(ModelError::RuntimeUnavailable(
-                            "SAO proxy not initialized".to_string(),
-                        ))
-                    });
+                let result = match self.sao_proxy.as_ref() {
+                    Some(p) => p.generate_ego_response(prompt, ethics).await,
+                    None => Err(ModelError::RuntimeUnavailable(
+                        "SAO proxy not initialized".to_string(),
+                    )),
+                };
                 match result {
                     Ok(text) => {
                         self.record(ModelCallStatus {
@@ -345,53 +356,55 @@ impl ModelProvider for ModelRouter {
                             model: self.config.ego_model.clone(),
                             message: Some(error.to_string()),
                         });
-                        self.fallback_ego(prompt, ethics)
+                        self.fallback_ego(prompt, ethics).await
                     }
                 }
             }
-            ModelProviderKind::OllamaWithFallback => match self.ollama.generate_ego_response(prompt, ethics) {
-                Ok(text) => {
-                    self.record(ModelCallStatus {
-                        role: ModelRole::Ego,
-                        provider: ModelProviderKind::OllamaWithFallback,
-                        state: ModelCallState::Healthy,
-                        model: self.config.ego_model.clone(),
-                        message: None,
-                    });
-                    Ok(text)
+            ModelProviderKind::OllamaWithFallback => {
+                match self.ollama.generate_ego_response(prompt, ethics).await {
+                    Ok(text) => {
+                        self.record(ModelCallStatus {
+                            role: ModelRole::Ego,
+                            provider: ModelProviderKind::OllamaWithFallback,
+                            state: ModelCallState::Healthy,
+                            model: self.config.ego_model.clone(),
+                            message: None,
+                        });
+                        Ok(text)
+                    }
+                    Err(error) => {
+                        self.record(ModelCallStatus {
+                            role: ModelRole::Ego,
+                            provider: ModelProviderKind::OllamaWithFallback,
+                            state: ModelCallState::Degraded,
+                            model: self.config.ego_model.clone(),
+                            message: Some(error.to_string()),
+                        });
+                        self.fallback_ego(prompt, ethics).await
+                    }
                 }
-                Err(error) => {
-                    self.record(ModelCallStatus {
-                        role: ModelRole::Ego,
-                        provider: ModelProviderKind::OllamaWithFallback,
-                        state: ModelCallState::Degraded,
-                        model: self.config.ego_model.clone(),
-                        message: Some(error.to_string()),
-                    });
-                    self.fallback_ego(prompt, ethics)
-                }
-            },
+            }
         }
     }
 }
 
 pub struct OllamaModelProvider {
     config: ModelConfig,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 impl OllamaModelProvider {
     pub fn new(config: ModelConfig) -> Self {
         let timeout = Duration::from_millis(config.timeout_ms);
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         Self { config, client }
     }
 
-    fn generate(
+    async fn generate(
         &self,
         role: ModelRole,
         model: &str,
@@ -420,6 +433,7 @@ impl OllamaModelProvider {
             .post(url)
             .json(&request)
             .send()
+            .await
             .map_err(|error| map_reqwest_error(error, self.config.timeout_ms))?;
 
         let status = response.status();
@@ -432,14 +446,16 @@ impl OllamaModelProvider {
 
         let body = response
             .text()
+            .await
             .map_err(|error| ModelError::HttpFailure(error.to_string()))?;
 
         parse_ollama_generate_response(&body)
     }
 }
 
+#[async_trait]
 impl ModelProvider for OllamaModelProvider {
-    fn consult_id(
+    async fn consult_id(
         &self,
         identity: &IdentityState,
         query: &str,
@@ -463,9 +479,10 @@ impl ModelProvider for OllamaModelProvider {
             prompt,
             self.config.id_temperature,
         )
+        .await
     }
 
-    fn generate_ego_response(
+    async fn generate_ego_response(
         &self,
         prompt: &ModelPrompt,
         ethics: &EthicsOverlay,
@@ -484,6 +501,7 @@ impl ModelProvider for OllamaModelProvider {
             user_prompt,
             self.config.ego_temperature,
         )
+        .await
     }
 }
 
@@ -543,7 +561,7 @@ fn map_reqwest_error(error: reqwest::Error, timeout_ms: u64) -> ModelError {
 pub struct SaoProxyProvider {
     config: ModelConfig,
     sao: SaoClientConfig,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 #[derive(Serialize)]
@@ -568,10 +586,10 @@ struct SaoProxyResponse {
 impl SaoProxyProvider {
     pub fn new(config: ModelConfig, sao: SaoClientConfig) -> Self {
         let timeout = std::time::Duration::from_millis(config.timeout_ms);
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config,
             sao,
@@ -579,7 +597,7 @@ impl SaoProxyProvider {
         }
     }
 
-    fn call(
+    async fn call(
         &self,
         role: ModelRole,
         model: &str,
@@ -612,11 +630,13 @@ impl SaoProxyProvider {
             .bearer_auth(&self.sao.bearer_token)
             .json(&body)
             .send()
+            .await
             .map_err(|error| map_reqwest_error(error, self.config.timeout_ms))?;
 
         let status = response.status();
         let text = response
             .text()
+            .await
             .map_err(|error| ModelError::HttpFailure(error.to_string()))?;
 
         if !status.is_success() {
@@ -625,8 +645,8 @@ impl SaoProxyProvider {
             )));
         }
 
-        let parsed: SaoProxyResponse = serde_json::from_str(&text)
-            .map_err(|e| ModelError::InvalidResponse(e.to_string()))?;
+        let parsed: SaoProxyResponse =
+            serde_json::from_str(&text).map_err(|e| ModelError::InvalidResponse(e.to_string()))?;
         if let Some(err) = parsed.error {
             return Err(ModelError::RuntimeUnavailable(err));
         }
@@ -637,8 +657,9 @@ impl SaoProxyProvider {
     }
 }
 
+#[async_trait]
 impl ModelProvider for SaoProxyProvider {
-    fn consult_id(
+    async fn consult_id(
         &self,
         identity: &IdentityState,
         query: &str,
@@ -661,9 +682,10 @@ impl ModelProvider for SaoProxyProvider {
             prompt,
             self.config.id_temperature,
         )
+        .await
     }
 
-    fn generate_ego_response(
+    async fn generate_ego_response(
         &self,
         prompt: &ModelPrompt,
         ethics: &EthicsOverlay,
@@ -681,6 +703,7 @@ impl ModelProvider for SaoProxyProvider {
             user_prompt,
             self.config.ego_temperature,
         )
+        .await
     }
 }
 
@@ -703,8 +726,8 @@ mod tests {
         assert!(matches!(error, ModelError::InvalidResponse(_)));
     }
 
-    #[test]
-    fn router_falls_back_when_ollama_is_unavailable() {
+    #[tokio::test]
+    async fn router_falls_back_when_ollama_is_unavailable() {
         let config = ModelConfig {
             ollama_base_url: "http://127.0.0.1:9".to_string(),
             timeout_ms: 50,
@@ -713,7 +736,7 @@ mod tests {
         let router = ModelRouter::new(config);
         let identity = IdentityState::bootstrap();
 
-        let text = router.consult_id(&identity, "hello", "").unwrap();
+        let text = router.consult_id(&identity, "hello", "").await.unwrap();
         let statuses = router.statuses();
 
         assert!(text.contains("Orion remains"));

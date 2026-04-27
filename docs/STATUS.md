@@ -1,6 +1,6 @@
 # OrionII — Status
 
-_Last updated: 2026-04-26_
+_Last updated: 2026-04-27_
 
 For the canonical project-wide status (SAO + OrionII together), see
 [`C:\Repo\SAO\docs\STATUS.md`](https://github.com/jbcupps/SAO/blob/feat/orion-entity-bundle-llm-proxy/docs/STATUS.md).
@@ -9,8 +9,11 @@ This file is the OrionII-specific snapshot.
 ## Where we are
 
 The desktop entity reliably boots from a SAO-issued bundle, dynamically self-configures via
-the birth event, and routes Id/Ego prompts through SAO's LLM proxy. Verified live against
-Anthropic Haiku 4.5 — the OrionII chat panel shows real Claude responses.
+the birth event, routes Id/Ego prompts through SAO's LLM proxy, and runs Mentor, Id, Ego, local
+Superego, UI emission, and SAO egress through the entity-internal `EventBus`. NATS JetStream is
+now the packaged durable bus transport behind `bus_transport`; release MSI builds run
+`scripts/build-installer.ps1` to prepare and package the `nats-server` sidecar through Tauri
+`externalBin`. The earlier Iggy adapter remains experimental.
 
 ## Shipped
 
@@ -40,12 +43,19 @@ Anthropic Haiku 4.5 — the OrionII chat panel shows real Claude responses.
 - Three-mode status header: **birthed** (live SAO), **anchor only** (config loaded but birth
   failed), **offline** (no anchor).
 - Birthed view shows owner / provider / id-model / ego-model / birthed-at + policy version.
-- **Enroll with SAO** yellow panel — pastes the bundle JSON, validates, writes it, hot-swaps
-  OrionCore. Disappears once birthed.
+- **Enroll with SAO** yellow panel — legacy/manual fallback for pasting bundle JSON. The primary
+  non-technical path is SAO's downloaded ZIP: double-click `Install-OrionII.cmd`, which writes
+  `%APPDATA%\OrionII\config.json`, runs the MSI, and starts OrionII.
 - Existing chat + SAO sync controls (Refresh policy, Ship egress) preserved.
 
 ### Operational
 - Egress payloads stamp `clientVersion` (OrionII semver) on every batch.
+- Chat flow now publishes a correlated `egress.outbound` audit envelope after `ego.action`;
+  the egress subscriber sanitizes and ships it through the single SAO HTTP seam.
+- Bus transport is selectable with `config.json` `bus_transport`: `in_memory`,
+  `nats_jetstream`, `external_nats_jetstream`, `bundled_iggy`, or `external_iggy`. Release
+  builds run `scripts/build-installer.ps1` so bundled installs have the local NATS JetStream
+  sidecar while normal developer `cargo check` remains sidecar-free.
 - Compatible with the SAO self-serve installer-source registry — installs end-to-end without
   any host-side MSI staging.
 
@@ -53,11 +63,12 @@ Anthropic Haiku 4.5 — the OrionII chat panel shows real Claude responses.
 
 | Gate | Status |
 |---|---|
+| `cargo check` | ✅ clean |
 | `cargo clippy --all-targets -- -D warnings` | ✅ clean |
-| `cargo test` | ✅ 18 tests pass |
+| `cargo test --lib` | ✅ 24 tests pass, 0 ignored |
 | `npm run build` | ✅ clean |
-| `npm run tauri build -- --bundles msi` | ✅ produces working MSI |
-| Live e2e: birth + LLM proxy → Anthropic Haiku 4.5 | ✅ real responses in chat |
+| `npm run build:installer` | Not rerun in this verification pass |
+| Live e2e: birth + LLM proxy → Anthropic Haiku 4.5 | Needs paired SAO-window UAT after latest NATS changes |
 
 ## Open
 
@@ -72,6 +83,10 @@ Anthropic Haiku 4.5 — the OrionII chat panel shows real Claude responses.
   one-click enroll an installed OrionII without paste/file-drop.
 - **First-run UX polish** — make the Enroll panel even more discoverable (e.g., focus the
   textarea on launch when offline).
+- **Live NATS durability UAT** — verify restart replay and supervisor crash behavior with the
+  packaged `nats-server` sidecar.
+- **Iggy adapter hardening** — optional path only; official Windows server convenience binaries
+  from Apache Iggy are not published yet.
 
 ## Open PRs
 
