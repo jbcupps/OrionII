@@ -17,24 +17,44 @@ The bundle path is preferred for any flow you want to mirror what real users exp
 ### Bundle contents
 
 ```
-config.json            -- entity identity + LLM defaults
+config.json            -- anchor: SAO base URL + entity identity token
 OrionII-Setup.msi      -- Tauri installer (Windows)
 README-FIRST-RUN.txt   -- install steps for the user
 ```
 
 ### `config.json` shape
 
+Only `sao_base_url` and `agent_token` are required — they are the anchor OrionII needs to
+reach SAO and call birth. Everything else is fallback for offline mode + back-compat with
+older clients.
+
 ```json
 {
   "sao_base_url":      "http://localhost:3100",
   "agent_id":          "1c9d0fb8-0b2c-4c1e-99a7-...",
   "agent_token":       "eyJhbGciOiJIUzI1NiJ9...<JWT>",
-  "default_provider":  "ollama",
-  "default_id_model":  "llama3.2",
-  "default_ego_model": "llama3.2",
-  "client_version_min": "0.1.0"
+  "client_version_min": "0.1.0",
+  "fallback": {
+    "default_provider":  "anthropic",
+    "default_id_model":  "claude-haiku-4-5-20251001",
+    "default_ego_model": "claude-haiku-4-5-20251001"
+  },
+  "default_provider":  "anthropic",
+  "default_id_model":  "claude-haiku-4-5-20251001",
+  "default_ego_model": "claude-haiku-4-5-20251001"
 }
 ```
+
+### How the user gets the config in place
+
+Two equivalent paths:
+
+1. **Filesystem drop** — copy `config.json` to `%APPDATA%\OrionII\config.json` (or co-locate
+   it with `OrionII.exe`) before launching.
+2. **In-app paste UI** — launch OrionII first; the yellow **Enroll with SAO** panel is
+   visible until birth succeeds. Paste the JSON, click **Apply config**. OrionII validates,
+   writes the file to `%APPDATA%\OrionII\config.json`, and hot-swaps the running OrionCore —
+   no restart. Backed by the Tauri command `apply_bundle_config(json)` in `lib.rs`.
 
 `agent_token` is an OIDC-shaped JWT (`principal_type=non_human`, `human_owner=<user_id>`,
 `scope=orion:policy orion:egress llm:generate`). Treat it like any API key — local-disk only,
@@ -115,6 +135,10 @@ npm run tauri build -- --bundles msi
 
 ## Related SAO docs
 
-- `C:\Repo\SAO\docs\orion-sao-mvp.md` — shared API contract.
-- `C:\Repo\SAO\docs\runbooks\local-orion-sao-mvp.md` — full local end-to-end runbook.
+- `C:\Repo\SAO\docs\STATUS.md` — canonical project-wide status.
+- `C:\Repo\SAO\docs\orion-sao-mvp.md` — shared API contract (now includes the
+  `/api/orion/birth` shape and the installer-source registry).
+- `C:\Repo\SAO\docs\runbooks\local-orion-sao-mvp.md` — full local end-to-end runbook,
+  including admin installer-source flow and the `SAO_VAULT_PASSPHRASE` auto-unseal step.
 - `C:\Repo\SAO\scripts\local-mvp-smoke.ps1` — smoke test (extended to exercise provider + bundle).
+- [`docs/STATUS.md`](STATUS.md) — OrionII-side status snapshot.
