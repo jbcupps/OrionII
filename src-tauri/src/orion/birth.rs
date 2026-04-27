@@ -94,23 +94,25 @@ pub enum BirthError {
     Rejected { status: u16, body: String },
 }
 
-pub fn fetch_birth(config: &SaoClientConfig) -> Result<BirthResponse, BirthError> {
+pub async fn fetch_birth(config: &SaoClientConfig) -> Result<BirthResponse, BirthError> {
     let url = format!("{}/api/orion/birth", config.base_url);
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| BirthError::Http(e.to_string()))?;
+        .map_err(|e: reqwest::Error| BirthError::Http(e.to_string()))?;
 
     let response = client
         .get(&url)
         .bearer_auth(&config.bearer_token)
         .send()
-        .map_err(|e| BirthError::Http(e.to_string()))?;
+        .await
+        .map_err(|e: reqwest::Error| BirthError::Http(e.to_string()))?;
 
     let status = response.status();
     let text = response
         .text()
-        .map_err(|e| BirthError::Http(e.to_string()))?;
+        .await
+        .map_err(|e: reqwest::Error| BirthError::Http(e.to_string()))?;
 
     if !status.is_success() {
         return Err(BirthError::Rejected {

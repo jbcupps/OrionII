@@ -6,15 +6,31 @@
 //! and should be rejected in code review (see ADR-001 and CLAUDE.md).
 //!
 //! The trait exists so the underlying transport can be swapped from the
-//! in-process default (`InMemoryBus`, tokio broadcast) to Apache Iggy in a
-//! later phase without touching callers. New code MUST NOT depend on the
-//! concrete bus type — depend on `SharedBus` instead.
+//! in-process default (`InMemoryBus`, tokio broadcast) to Apache Iggy
+//! without touching callers. New code MUST NOT depend on the concrete bus
+//! type — depend on `SharedBus` and the `EventBus` trait instead.
+//!
+//! `publish` is async because the future Iggy backend's publish is a network
+//! call. `subscribe` stays sync but returns a `BusReceiver` wrapper whose
+//! `recv` is async on every backend. Subscribers always look like:
+//!
+//! ```ignore
+//! let mut rx = bus.subscribe(Topic::EgoAction);
+//! loop {
+//!     match rx.recv().await {
+//!         Ok(env) => handle(env).await,
+//!         Err(RecvError::Lagged(n)) => eprintln!("dropped {n}"),
+//!         Err(RecvError::Closed) => break,
+//!     }
+//! }
+//! ```
 //!
 //! New variants on `Topic` require an ADR. Resurrected interrupt/agent-task
 //! topics: see future ADR-002+.
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -27,35 +43,15 @@ pub mod inmem;
 pub use inmem::InMemoryBus;
 
 /// Canonical topic set for the entity-internal bus.
-///
-/// Eight variants cover the bicameral structure (Mentor → Id → Ego, with the
-/// local Superego observing) plus the two seam topics that bridge the entity
-/// to SAO over HTTP. Add variants here, never use raw strings at call sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Topic {
-    /// User input from the mentor (the human operator). Published by the
-    /// Tauri `send_chat_message` command adapter.
     MentorInput,
-    /// External sensory input (file drops, future web ingestion). Reserved.
     IdStimulus,
-    /// Id's pre-reflective response, published after the curator/Id pipeline
-    /// has digested a `MentorInput`.
     IdReaction,
-    /// Ego's reasoning trace, published while it deliberates. Useful for
-    /// future audit UIs; not a primary control-flow input.
     EgoDeliberation,
-    /// Ego's chosen action — for chat, this is what the UI renders.
     EgoAction,
-    /// Local Superego stub's evaluation of an `EgoAction` against the cached
-    /// `soul_ref`. Phase 1 is logging-only; later phases plug in real
-    /// constitutional checks.
     SuperegoLocalEvaluation,
-    /// The ethical seam to SAO. Anything that crosses out of the entity must
-    /// land here and be picked up by the egress subscriber, which sanitizes
-    /// (NPPI) before shipping to SAO over HTTP.
     EgressOutbound,
-    /// Inbound governance from SAO (policy, proposals, external Superego
-    /// evaluations). Reserved — populated by the SAO policy client.
     GovernanceInbound,
 }
 
@@ -73,8 +69,6 @@ impl Topic {
         }
     }
 
-    /// All canonical topics. The `InMemoryBus` pre-registers a channel for
-    /// each so `subscribe` never races with `publish`.
     pub const ALL: &'static [Topic] = &[
         Topic::MentorInput,
         Topic::IdStimulus,
@@ -87,19 +81,13 @@ impl Topic {
     ];
 }
 
-/// Every event on the bus carries provenance. `agent_id` and `soul_ref`
-/// together make the constitutional layer auditable: no event without a
-/// source identity and a reference to the soul document the entity was
-/// operating under at the time.
+/// Every event on the bus carries provenance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub topic: Topic,
     pub agent_id: String,
     pub occurred_at: DateTime<Utc>,
     pub soul_ref: String,
-    /// Carry-through correlation id so a `MentorInput` and its eventual
-    /// `EgoAction` (and any intermediate `IdReaction` /
-    /// `SuperegoLocalEvaluation`) can be matched by the UI and by audits.
     pub correlation_id: Option<Uuid>,
     pub payload: serde_json::Value,
 }
@@ -127,38 +115,74 @@ impl Envelope {
 pub enum BusError {
     #[error("transport error: {0}")]
     Transport(String),
-    #[error("subscriber lagged and dropped {0} events")]
-    Lagged(u64),
     #[error("topic channel closed")]
     Closed,
 }
 
-/// The entity's event bus.
-///
-/// Both methods are intentionally synchronous. `publish` wraps a
-/// `tokio::sync::broadcast::Sender::send`, which never blocks — it returns
-/// `Ok(receiver_count)` or `Err(SendError)` and does not await. `subscribe`
-/// returns a `broadcast::Receiver`; the caller consumes it inside an async
-/// task with `rx.recv().await`.
-///
-/// Keeping `publish` sync means Tauri commands and other sync entry points
-/// can call into the bus without `tauri::async_runtime::block_on` gymnastics.
-pub trait EventBus: Send + Sync {
-    fn publish(&self, env: Envelope) -> Result<(), BusError>;
-    fn subscribe(&self, topic: Topic) -> broadcast::Receiver<Envelope>;
+/// Receive-side errors. Mirrors the broadcast crate's shape so subscribers
+/// can keep the same `match` arms across transports.
+#[derive(Debug, thiserror::Error)]
+pub enum RecvError {
+    /// The subscriber fell behind the channel buffer and `n` envelopes were
+    /// dropped. The receiver is still usable; subsequent `recv()` calls
+    /// return the most-recent values still in the buffer.
+    #[error("subscriber lagged and dropped {0} envelopes")]
+    Lagged(u64),
+    /// The publisher half of the channel has been dropped; no more events
+    /// will arrive.
+    #[error("topic channel closed")]
+    Closed,
 }
 
-/// Shared, owning handle to the bus. Subscriber tasks clone this. The
-/// underlying bus stays alive as long as any participant holds a `SharedBus`,
-/// which is what we want — drops cascade naturally when `OrionCore` is
-/// replaced.
+impl From<broadcast::error::RecvError> for RecvError {
+    fn from(value: broadcast::error::RecvError) -> Self {
+        match value {
+            broadcast::error::RecvError::Lagged(n) => RecvError::Lagged(n),
+            broadcast::error::RecvError::Closed => RecvError::Closed,
+        }
+    }
+}
+
+/// Subscriber-side handle. Wraps either a tokio broadcast receiver
+/// (`InMemoryBus`) or — in Phase 2b — an Iggy consumer. Subscribers
+/// don't need to know which.
+pub struct BusReceiver {
+    inner: BusReceiverInner,
+}
+
+enum BusReceiverInner {
+    InMemory(broadcast::Receiver<Envelope>),
+    // Iggy variant added in Phase 2b. Present-day code routes only the
+    // in-memory path; adding a variant here is non-breaking for callers.
+}
+
+impl BusReceiver {
+    pub fn from_broadcast(rx: broadcast::Receiver<Envelope>) -> Self {
+        Self {
+            inner: BusReceiverInner::InMemory(rx),
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<Envelope, RecvError> {
+        match &mut self.inner {
+            BusReceiverInner::InMemory(rx) => rx.recv().await.map_err(RecvError::from),
+        }
+    }
+}
+
+/// The entity's event bus.
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    async fn publish(&self, env: Envelope) -> Result<(), BusError>;
+    fn subscribe(&self, topic: Topic) -> BusReceiver;
+}
+
+/// Shared, owning handle to the bus.
 pub type SharedBus = Arc<dyn EventBus>;
 
 /// Phase 1 surrogate for `soul_ref`. SAO does not yet ship a signed
 /// `soul.md` blob at birth — when it does, replace this with
-/// `hex(blake3(soul_md_bytes))` in this single helper. Every callsite that
-/// constructs an `Envelope` calls this; no other change required when the
-/// real hash lands. See ADR-001 § "Phase 1 surrogate".
+/// `hex(blake3(soul_md_bytes))` in this single helper.
 pub fn current_soul_ref(identity: &IdentityState) -> String {
     // TODO(soul-md-hash): replace with hex(blake3(soul_md_bytes)) once SAO
     // ships a signed soul.md blob at birth and the entity caches it.

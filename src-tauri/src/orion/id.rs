@@ -2,9 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
-use tokio::sync::broadcast;
 
-use crate::orion::bus::{current_soul_ref, Envelope, SharedBus, Topic};
+use crate::orion::bus::{current_soul_ref, Envelope, RecvError, SharedBus, Topic};
 use crate::orion::curator::CuratorRuntime;
 use crate::orion::identity::IdentityState;
 use crate::orion::model::{ModelProvider, ModelRouter};
@@ -22,22 +21,22 @@ pub struct IdSignal {
 pub struct IdRuntime;
 
 impl IdRuntime {
-    pub fn consult(
+    pub async fn consult(
         &self,
         identity: &IdentityState,
         query: &str,
         context: &str,
-        model: &impl ModelProvider,
+        model: &(dyn ModelProvider),
     ) -> IdSignal {
-        let personality_signal =
-            model
-                .consult_id(identity, query, context)
-                .unwrap_or_else(|error| {
-                    format!(
-                        "{} remains {}. Local Id model degraded: {}.",
-                        identity.personality.name, identity.personality.stance, error
-                    )
-                });
+        let personality_signal = model
+            .consult_id(identity, query, context)
+            .await
+            .unwrap_or_else(|error| {
+                format!(
+                    "{} remains {}. Local Id model degraded: {}.",
+                    identity.personality.name, identity.personality.stance, error
+                )
+            });
 
         IdSignal {
             identity_version: identity.version,
@@ -64,10 +63,6 @@ pub struct IdReactionPayload {
 /// Subscribes to `Topic::MentorInput`, runs the curator + Id pipeline against
 /// the persisted identity and document context, and publishes
 /// `Topic::IdReaction`. The Ego subscriber takes it from there.
-///
-/// This is a *participant* on the bus, not an implementation detail of any
-/// other module. Direct calls into `CuratorRuntime` or `IdRuntime` from
-/// outside this file are an architectural regression — see CLAUDE.md.
 pub fn spawn(
     bus: SharedBus,
     persistence: Arc<Mutex<FilePersistence>>,
@@ -78,15 +73,10 @@ pub fn spawn(
         loop {
             match rx.recv().await {
                 Ok(env) => handle_mentor_input(&bus, &persistence, &model, env).await,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!(
-                        "[id-subscriber] lagged on MentorInput, skipped {skipped} envelopes"
-                    );
+                Err(RecvError::Lagged(skipped)) => {
+                    eprintln!("[id-subscriber] lagged on MentorInput, skipped {skipped} envelopes");
                 }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Bus dropped — exit cleanly.
-                    break;
-                }
+                Err(RecvError::Closed) => break,
             }
         }
     })
@@ -108,17 +98,13 @@ async fn handle_mentor_input(
         return;
     }
 
-    // Sync model + persistence work runs via `block_in_place`, which keeps
-    // the work on the current async worker but tells the runtime to spin
-    // up a replacement worker so other subscribers stay responsive.
-    // Unlike `spawn_blocking`, this does not create a detached task that
-    // could outlive an aborted parent — important when `OrionCore::drop`
-    // aborts subscribers on hot-swap.
     let agent_id = env.agent_id.clone();
     let correlation_id = env.correlation_id;
 
     let curator = CuratorRuntime::default();
 
+    // Lock briefly to clone the identity and retrieve document context.
+    // Release before .await on the model.
     let (soul_ref, identity, document_context) = {
         let p = persistence.lock().expect("persistence mutex poisoned");
         let identity = p.identity().clone();
@@ -127,9 +113,9 @@ async fn handle_mentor_input(
         (soul_ref, identity, document_context)
     };
 
-    let curated = tokio::task::block_in_place(|| {
-        curator.curate_raw(&user_query, &identity, &document_context, model.as_ref())
-    });
+    let curated = curator
+        .curate_raw(&user_query, &identity, &document_context, model.as_ref())
+        .await;
 
     let payload = IdReactionPayload {
         user_query,
@@ -147,7 +133,7 @@ async fn handle_mentor_input(
         correlation_id,
         value,
     );
-    if let Err(error) = bus.publish(reaction) {
+    if let Err(error) = bus.publish(reaction).await {
         eprintln!("[id-subscriber] failed to publish IdReaction: {error}");
     }
 }

@@ -21,20 +21,19 @@ pub struct CuratedRaw {
 }
 
 impl CuratorRuntime {
-    pub fn curate_raw(
+    pub async fn curate_raw(
         &self,
         user_query: &str,
         identity: &IdentityState,
         document_context: &str,
-        model: &impl ModelProvider,
+        model: &(dyn ModelProvider),
     ) -> CuratedRaw {
         let id_signal = self
             .id
-            .consult(identity, user_query, document_context, model);
+            .consult(identity, user_query, document_context, model)
+            .await;
         let ethics = EthicsOverlay::scaffold(
-            EthicsScaffoldInput {
-                user_query,
-            },
+            EthicsScaffoldInput { user_query },
             &identity.ethics_lean,
         );
         let context_summary = if document_context.is_empty() {

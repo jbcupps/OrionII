@@ -150,14 +150,14 @@ pub enum SaoClientError {
 
 pub struct SaoShipper {
     config: Option<SaoClientConfig>,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 impl Default for SaoShipper {
     fn default() -> Self {
         Self {
             config: SaoClientConfig::from_env(),
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::Client::new(),
         }
     }
 }
@@ -166,7 +166,7 @@ impl SaoShipper {
     pub fn with_config(config: Option<SaoClientConfig>) -> Self {
         Self {
             config,
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::Client::new(),
         }
     }
 
@@ -175,7 +175,11 @@ impl SaoShipper {
         Self::with_config(config)
     }
 
-    pub fn ship_pending(&self, records: &mut [SaoEgressRecord], orion_id: Uuid) -> ShipReport {
+    pub async fn ship_pending(
+        &self,
+        records: &mut [SaoEgressRecord],
+        orion_id: Uuid,
+    ) -> ShipReport {
         let mut report = ShipReport {
             attempted: 0,
             acked: 0,
@@ -223,7 +227,8 @@ impl SaoShipper {
                 events,
                 client_version: crate::orion::bootstrap::CLIENT_VERSION,
             })
-            .send();
+            .send()
+            .await;
 
         let Ok(response) = response else {
             report.failed = report.attempted;
@@ -234,7 +239,7 @@ impl SaoShipper {
             return report;
         }
 
-        let Ok(response) = response.json::<SaoEgressResponse>() else {
+        let Ok(response) = response.json::<SaoEgressResponse>().await else {
             report.failed = report.attempted;
             return report;
         };
@@ -254,7 +259,7 @@ impl SaoShipper {
         report
     }
 
-    pub fn fetch_policy(&self) -> Result<PolicyOverlay, SaoClientError> {
+    pub async fn fetch_policy(&self) -> Result<PolicyOverlay, SaoClientError> {
         let Some(config) = &self.config else {
             return Err(SaoClientError::NotConfigured);
         };
@@ -263,9 +268,11 @@ impl SaoShipper {
             .client
             .get(format!("{}/api/orion/policy", config.base_url))
             .bearer_auth(&config.bearer_token)
-            .send()?
+            .send()
+            .await?
             .error_for_status()?
-            .json::<PolicyOverlay>()?;
+            .json::<PolicyOverlay>()
+            .await?;
 
         Ok(policy)
     }
@@ -425,8 +432,8 @@ mod tests {
         assert_eq!(merged.policy.version, 2);
     }
 
-    #[test]
-    fn shipper_acks_pending_records_without_dropping_history() {
+    #[tokio::test]
+    async fn shipper_acks_pending_records_without_dropping_history() {
         let mut records = vec![SaoEgressRecord::pending(SaoEvent::AuditAction {
             action: "open local document".to_string(),
             correlation_id: Uuid::new_v4(),
@@ -454,7 +461,7 @@ mod tests {
             bearer_token: "dev-token".to_string(),
             agent_id: None,
         }));
-        let report = shipper.ship_pending(&mut records, Uuid::new_v4());
+        let report = shipper.ship_pending(&mut records, Uuid::new_v4()).await;
 
         assert_eq!(report.attempted, 1);
         assert_eq!(report.acked, 1);
@@ -463,13 +470,15 @@ mod tests {
         handle.join().unwrap();
     }
 
-    #[test]
-    fn shipper_leaves_records_pending_when_unconfigured() {
+    #[tokio::test]
+    async fn shipper_leaves_records_pending_when_unconfigured() {
         let mut records = vec![SaoEgressRecord::pending(SaoEvent::IdentitySync {
             orion_id: Uuid::new_v4(),
             version: 1,
         })];
-        let report = SaoShipper::new(None).ship_pending(&mut records, Uuid::new_v4());
+        let report = SaoShipper::new(None)
+            .ship_pending(&mut records, Uuid::new_v4())
+            .await;
 
         assert_eq!(report.acked, 0);
         assert_eq!(report.failed, 1);

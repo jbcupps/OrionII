@@ -5,18 +5,19 @@ use serde_json::json;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
 use thiserror::Error;
-use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::orion::birth::BirthResponse;
 use crate::orion::bootstrap::OrionBootstrap;
-use crate::orion::bus::{current_soul_ref, BusError, Envelope, InMemoryBus, SharedBus, Topic};
+use crate::orion::bus::{
+    current_soul_ref, BusError, Envelope, InMemoryBus, RecvError, SharedBus, Topic,
+};
 use crate::orion::ego::EgoActionPayload;
 use crate::orion::model::{ModelCallStatus, ModelProviderKind, ModelRouter};
 #[cfg(test)]
 use crate::orion::model::ModelConfig;
 use crate::orion::persistence::{FilePersistence, Persistence, PersistenceError};
-use crate::orion::sao::{SaoClientConfig, SaoClientError, SaoShipper, ShipReport};
+use crate::orion::sao::{SaoClientConfig, SaoClientError, SaoEgressRecord, SaoShipper, ShipReport};
 use crate::orion::security::{ConstitutionalVerifier, SecurityHealth};
 use crate::orion::skills::{DocumentSkill, OAuthSkillCatalog, SkillAuthorization};
 use crate::orion::{egress, ego, id, superego_local};
@@ -77,23 +78,19 @@ pub struct OrionCore {
 
 impl Default for OrionCore {
     fn default() -> Self {
-        Self::from_bootstrap(OrionBootstrap::load())
+        // Sync default kept for legacy callers. Drives the async load + build
+        // path via tauri's runtime.
+        tauri::async_runtime::block_on(async {
+            let bootstrap = OrionBootstrap::load().await;
+            Self::build_async(bootstrap, None).await
+        })
     }
 }
 
 impl OrionCore {
-    pub fn from_bootstrap(bootstrap: OrionBootstrap) -> Self {
-        Self::build(bootstrap, None)
-    }
-
-    /// Same as `from_bootstrap`, plus wires a UI emitter subscriber that
-    /// republishes `Topic::EgoAction` envelopes as the
-    /// `orion://ego.action` Tauri event so the React app can consume them.
-    pub fn from_bootstrap_with_app(bootstrap: OrionBootstrap, app: AppHandle) -> Self {
-        Self::build(bootstrap, Some(app))
-    }
-
-    fn build(bootstrap: OrionBootstrap, app: Option<AppHandle>) -> Self {
+    /// Async constructor. Phase 2a: in-memory bus, no awaits actually fire.
+    /// Phase 2b will add the Iggy connect path that does .await here.
+    pub async fn build_async(bootstrap: OrionBootstrap, app: Option<AppHandle>) -> Self {
         let mut oauth_catalog = OAuthSkillCatalog::default();
         oauth_catalog.register(SkillAuthorization::oauth(
             "external-documents",
@@ -147,6 +144,22 @@ impl OrionCore {
         }
     }
 
+    /// Sync wrapper that loads bootstrap + builds in a single block_on.
+    /// Prefer `build_async` from inside async code.
+    pub fn from_bootstrap_blocking() -> Self {
+        tauri::async_runtime::block_on(async {
+            let bootstrap = OrionBootstrap::load().await;
+            Self::build_async(bootstrap, None).await
+        })
+    }
+
+    pub fn from_bootstrap_with_app_blocking(app: AppHandle) -> Self {
+        tauri::async_runtime::block_on(async {
+            let bootstrap = OrionBootstrap::load().await;
+            Self::build_async(bootstrap, Some(app)).await
+        })
+    }
+
     #[cfg(test)]
     pub fn with_persistence(persistence: FilePersistence) -> Self {
         let persistence = Arc::new(Mutex::new(persistence));
@@ -181,7 +194,7 @@ impl OrionCore {
     /// Publish a `MentorInput` envelope and return immediately. The Ego
     /// response arrives later as a Tauri event — see ADR-001 § "UI
     /// inversion".
-    pub fn send_chat_message(&self, text: String) -> Result<ChatExchange, OrionError> {
+    pub async fn send_chat_message(&self, text: String) -> Result<ChatExchange, OrionError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(OrionError::EmptyMessage);
@@ -205,7 +218,7 @@ impl OrionCore {
             Some(correlation_id),
             payload,
         );
-        self.bus.publish(env)?;
+        self.bus.publish(env).await?;
 
         Ok(ChatExchange {
             correlation_id,
@@ -225,9 +238,9 @@ impl OrionCore {
         Ok(count)
     }
 
-    pub fn apply_sao_policy_refresh(&self, rules: Vec<String>) -> Result<u64, OrionError> {
+    pub async fn apply_sao_policy_refresh(&self, rules: Vec<String>) -> Result<u64, OrionError> {
         let shipper = SaoShipper::with_config(self.sao_config.clone());
-        let policy = match shipper.fetch_policy() {
+        let policy = match shipper.fetch_policy().await {
             Ok(policy) => policy,
             Err(SaoClientError::NotConfigured) => {
                 let p = self.persistence.lock().expect("persistence mutex poisoned");
@@ -246,9 +259,26 @@ impl OrionCore {
         Ok(p.policy().version)
     }
 
-    pub fn ship_sao_egress(&self) -> Result<ShipReport, OrionError> {
+    /// User-triggered ship of any pending SAO egress backlog. Same take /
+    /// ship / merge dance as `egress::handle_outbound`, just exposed as a
+    /// command so the UI can flush the queue manually.
+    pub async fn ship_sao_egress(&self) -> Result<ShipReport, OrionError> {
+        let (orion_id, mut pending): (Uuid, Vec<SaoEgressRecord>) = {
+            let mut p = self.persistence.lock().expect("persistence mutex poisoned");
+            (p.identity().identity.orion_id, p.take_pending_egress())
+        };
+        if pending.is_empty() {
+            return Ok(ShipReport {
+                attempted: 0,
+                acked: 0,
+                failed: 0,
+            });
+        }
+        let shipper = SaoShipper::with_config(self.sao_config.clone());
+        let report = shipper.ship_pending(&mut pending, orion_id).await;
         let mut p = self.persistence.lock().expect("persistence mutex poisoned");
-        Ok(p.ship_sao_egress(self.sao_config.as_ref())?)
+        p.merge_egress_results(pending)?;
+        Ok(report)
     }
 
     pub fn sao_config(&self) -> Option<&SaoClientConfig> {
@@ -311,10 +341,10 @@ fn spawn_ui_emitter(bus: SharedBus, app: AppHandle) -> JoinHandle<()> {
                         eprintln!("[ui-emitter] failed to emit Tauri event: {error}");
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(RecvError::Lagged(skipped)) => {
                     eprintln!("[ui-emitter] lagged on EgoAction, skipped {skipped}");
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(RecvError::Closed) => break,
             }
         }
     })
@@ -331,16 +361,10 @@ mod tests {
     /// a non-empty soul_ref. The deterministic model provider keeps this
     /// hermetic — no Ollama, no SAO required.
     ///
-    /// Currently `#[ignore]`d because `ModelRouter` always constructs an
-    /// `OllamaModelProvider`, whose internal `reqwest::blocking::Client`
-    /// owns its own tokio runtime. That runtime panics when dropped inside
-    /// the test's outer async context, regardless of where we move `core`.
-    /// Resolving this is a follow-up ticket: convert `OllamaModelProvider`
-    /// and `SaoProxyProvider` to use `reqwest`'s async client (so they no
-    /// longer create nested runtimes) — see ADR-001 § "Out of scope". Once
-    /// that lands, remove the `#[ignore]` here.
+    /// Was `#[ignore]`d in Phase 1 because of `reqwest::blocking`'s nested
+    /// runtime panicking on drop inside an async context. Phase 2a's async
+    /// model layer removes that — there is no longer a nested runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "reqwest::blocking nested runtime; see follow-up ticket"]
     async fn mentor_input_round_trips_to_ego_action() {
         let dir = std::env::temp_dir().join(format!("orionii-test-{}", Uuid::new_v4()));
         let persistence = FilePersistence::open(&dir).unwrap();
@@ -350,6 +374,7 @@ mod tests {
 
         let ack = core
             .send_chat_message("Help me plan the day".to_string())
+            .await
             .unwrap();
         assert!(ack.accepted);
 
@@ -365,7 +390,7 @@ mod tests {
         let payload: EgoActionPayload = serde_json::from_value(env.payload).unwrap();
         assert!(!payload.response_text.is_empty());
 
-        std::thread::spawn(move || drop(core)).join().unwrap();
+        drop(core);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

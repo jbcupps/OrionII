@@ -50,7 +50,9 @@ pub struct OrionBootstrap {
 }
 
 impl OrionBootstrap {
-    pub fn load() -> Self {
+    /// Async load. Stage 1 (anchor) is sync disk I/O; stage 2 (birth) is the
+    /// SAO HTTP call, which Phase 2a converted to async `reqwest`.
+    pub async fn load() -> Self {
         let mut anchor = if let Some(bundle) = read_bundle_config() {
             tracing_log("loaded bundle config from disk");
 
@@ -94,7 +96,7 @@ impl OrionBootstrap {
 
         // Stage 2: live birth call. Best-effort; offline mode keeps the anchor defaults.
         if let Some(sao) = &anchor.sao {
-            match birth::fetch_birth(sao) {
+            match birth::fetch_birth(sao).await {
                 Ok(birth) => {
                     tracing_log(&format!(
                         "birthed as agent {} ({}) — live provider {} / id={} / ego={}",
@@ -130,7 +132,9 @@ impl OrionBootstrap {
 
 impl Default for OrionBootstrap {
     fn default() -> Self {
-        Self::load()
+        // Sync wrapper drives the async load via tauri's runtime. Prefer
+        // `OrionBootstrap::load().await` from inside async code.
+        tauri::async_runtime::block_on(Self::load())
     }
 }
 

@@ -2,24 +2,26 @@
 //!
 //! Anything that crosses out of the entity to SAO must first land on
 //! `Topic::EgressOutbound` and be picked up here. The subscriber runs each
-//! envelope through `sanitize()`, then enqueues it for the existing SAO
-//! shipper (HTTP `POST /api/orion/egress`). Centralizing the seam in one
-//! file is what prevents the Id from accidentally leaking raw stimulus to
-//! the mentor's governance plane — see ADR-001.
+//! envelope through `sanitize()`, enqueues an `SaoEgressRecord`, then ships
+//! it via `SaoShipper`. Centralizing the seam in one file is what prevents
+//! the Id from accidentally leaking raw stimulus to the mentor's governance
+//! plane — see ADR-001.
+//!
+//! Phase 2a moved the SAO HTTP call **into this file** from `Persistence`.
+//! `git grep -nE "SaoShipper" src-tauri/src` should match only here. That's
+//! the strongest form of Rule #4: exactly one file calls the egress client.
 //!
 //! Phase 1 sanitizer is a key-name redaction stub. Full NPPI-aware
-//! sanitization is `TODO(NPPI)` and lives in a separate ticket. The seam is
-//! load-bearing on Day 1; the policy inside the seam can deepen later
-//! without changing where anything sits.
+//! sanitization is `TODO(NPPI)` and lives in a separate ticket.
 
 use std::sync::{Arc, Mutex};
 
 use tauri::async_runtime::JoinHandle;
-use tokio::sync::broadcast;
+use uuid::Uuid;
 
-use crate::orion::bus::{Envelope, SharedBus, Topic};
+use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
 use crate::orion::persistence::{FilePersistence, Persistence};
-use crate::orion::sao::{SaoClientConfig, SaoEgressRecord, SaoEvent};
+use crate::orion::sao::{SaoClientConfig, SaoEgressRecord, SaoEvent, SaoShipper};
 
 pub fn spawn(
     bus: SharedBus,
@@ -28,23 +30,22 @@ pub fn spawn(
 ) -> JoinHandle<()> {
     let mut rx = bus.subscribe(Topic::EgressOutbound);
     tauri::async_runtime::spawn(async move {
+        let shipper = SaoShipper::with_config(sao_config);
         loop {
             match rx.recv().await {
-                Ok(env) => handle_outbound(&persistence, &sao_config, env),
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!(
-                        "[egress] lagged on EgressOutbound, skipped {skipped} envelopes"
-                    );
+                Ok(env) => handle_outbound(&persistence, &shipper, env).await,
+                Err(RecvError::Lagged(skipped)) => {
+                    eprintln!("[egress] lagged on EgressOutbound, skipped {skipped} envelopes");
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(RecvError::Closed) => break,
             }
         }
     })
 }
 
-fn handle_outbound(
+async fn handle_outbound(
     persistence: &Arc<Mutex<FilePersistence>>,
-    sao_config: &Option<SaoClientConfig>,
+    shipper: &SaoShipper,
     env: Envelope,
 ) {
     let sanitized = sanitize(env);
@@ -55,7 +56,7 @@ fn handle_outbound(
         .and_then(|v| v.as_str())
         .unwrap_or("egress")
         .to_string();
-    let correlation_id = sanitized.correlation_id.unwrap_or_else(uuid::Uuid::new_v4);
+    let correlation_id = sanitized.correlation_id.unwrap_or_else(Uuid::new_v4);
 
     let record = SaoEgressRecord::pending(
         SaoEvent::AuditAction {
@@ -65,20 +66,27 @@ fn handle_outbound(
         .sanitized(),
     );
 
-    {
+    // Enqueue under the lock; release before any .await.
+    let (orion_id, mut pending) = {
         let mut p = persistence.lock().expect("persistence mutex poisoned");
         if let Err(error) = p.enqueue_sao(record) {
             eprintln!("[egress] failed to enqueue SAO event: {error}");
             return;
         }
+        (p.identity().identity.orion_id, p.take_pending_egress())
+    };
+
+    if pending.is_empty() {
+        return;
     }
 
-    // Best-effort ship; failure is fine — the record stays Pending and the
-    // user-triggered ship_sao_egress command (or a future scheduled
-    // shipper) will retry.
+    // Ship outside the lock. SaoShipper makes the HTTP call.
+    let _report = shipper.ship_pending(&mut pending, orion_id).await;
+
+    // Merge results back under the lock.
     let mut p = persistence.lock().expect("persistence mutex poisoned");
-    if let Err(error) = p.ship_sao_egress(sao_config.as_ref()) {
-        eprintln!("[egress] ship attempt failed: {error}");
+    if let Err(error) = p.merge_egress_results(pending) {
+        eprintln!("[egress] failed to merge ship results: {error}");
     }
 }
 
@@ -86,10 +94,7 @@ fn handle_outbound(
 /// object key whose name matches the redaction list (case-insensitive).
 ///
 /// This is intentionally simple — it is not the real NPPI sanitizer
-/// (TODO(NPPI)). It exists so the seam is visibly load-bearing on Day 1:
-/// "egress sanitization actually does *something*" is what a code reader
-/// will see when they trace the path. The richer policy plugs in here
-/// without changing where it sits in the architecture.
+/// (TODO(NPPI)). It exists so the seam is visibly load-bearing on Day 1.
 pub fn sanitize(mut env: Envelope) -> Envelope {
     redact_in_place(&mut env.payload);
     env

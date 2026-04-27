@@ -17,18 +17,14 @@
 
 use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
-use tokio::sync::broadcast;
 
-use crate::orion::bus::{Envelope, SharedBus, Topic};
+use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuperegoLocalEvaluation {
     pub accepted: bool,
     pub soul_ref: String,
-    /// Free-form note. Future evaluators will populate this with rule
-    /// citations; today it just records the surrogate soul_ref shape so
-    /// audit consumers can prove a real evaluation happened.
     pub note: String,
 }
 
@@ -37,19 +33,17 @@ pub fn spawn(bus: SharedBus) -> JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(env) => publish_evaluation(&bus, env),
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!(
-                        "[superego-local] lagged on EgoAction, skipped {skipped} envelopes"
-                    );
+                Ok(env) => publish_evaluation(&bus, env).await,
+                Err(RecvError::Lagged(skipped)) => {
+                    eprintln!("[superego-local] lagged on EgoAction, skipped {skipped} envelopes");
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(RecvError::Closed) => break,
             }
         }
     })
 }
 
-fn publish_evaluation(bus: &SharedBus, env: Envelope) {
+async fn publish_evaluation(bus: &SharedBus, env: Envelope) {
     let evaluation = SuperegoLocalEvaluation {
         accepted: true,
         soul_ref: env.soul_ref.clone(),
@@ -66,7 +60,7 @@ fn publish_evaluation(bus: &SharedBus, env: Envelope) {
         env.correlation_id,
         value,
     );
-    if let Err(error) = bus.publish(envelope) {
+    if let Err(error) = bus.publish(envelope).await {
         eprintln!("[superego-local] failed to publish evaluation: {error}");
     }
 }

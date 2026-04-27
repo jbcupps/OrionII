@@ -1,7 +1,7 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use tauri::Manager;
+use tokio::sync::Mutex;
 
 mod orion;
 
@@ -25,89 +25,73 @@ struct SaoConnectionStatus {
 /// to the bus and returns immediately. The real work happens in subscriber
 /// tasks owned by `OrionCore`. See ADR-001 and AGENTS.md before adding a
 /// new command.
+///
+/// Phase 2a: commands are `async fn` because `EventBus::publish` is async
+/// and the OrionCore Mutex is now `tokio::sync::Mutex` (Send across .await,
+/// unlike `std::sync::Mutex`). The lock is held for the duration of each
+/// command body; Phase 2b will likely introduce a `Handle`-style accessor
+/// so commands can clone the shared `Arc` references and release the lock
+/// before any network I/O hits the Iggy bus.
 
 #[tauri::command]
-fn send_chat_message(
+async fn send_chat_message(
     text: String,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<orion::ChatExchange, String> {
-    let core = state
-        .lock()
-        .map_err(|_| "Orion core state lock was poisoned".to_string())?;
+    let core = state.lock().await;
     core.send_chat_message(text)
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn index_document(
+async fn index_document(
     source_path: String,
     contents: String,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<usize, String> {
-    let core = state
-        .lock()
-        .map_err(|_| "Orion core state lock was poisoned".to_string())?;
+    let core = state.lock().await;
     core.index_document(source_path, contents)
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn refresh_sao_policy(
+async fn refresh_sao_policy(
     rules: Vec<String>,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<u64, String> {
-    let core = state
-        .lock()
-        .map_err(|_| "Orion core state lock was poisoned".to_string())?;
+    let core = state.lock().await;
     core.apply_sao_policy_refresh(rules)
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn ship_sao_egress(
+async fn ship_sao_egress(
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<orion::sao::ShipReport, String> {
-    let core = state
-        .lock()
-        .map_err(|_| "Orion core state lock was poisoned".to_string())?;
-    core.ship_sao_egress().map_err(|error| error.to_string())
+    let core = state.lock().await;
+    core.ship_sao_egress()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn companion_status(
+async fn companion_status(
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
 ) -> Result<orion::service::CompanionStatusReport, String> {
-    let core = state
-        .lock()
-        .map_err(|_| "Orion core state lock was poisoned".to_string())?;
+    let core = state.lock().await;
     Ok(core.companion_status())
 }
 
 #[tauri::command]
-fn sao_connection_status(
+async fn sao_connection_status(
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
-) -> SaoConnectionStatus {
-    let core = match state.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return SaoConnectionStatus {
-                configured: false,
-                base_url: None,
-                agent_id: None,
-                birthed: false,
-                agent_name: None,
-                owner_username: None,
-                provider: None,
-                id_model: None,
-                ego_model: None,
-                birthed_at: None,
-                policy_version: None,
-            };
-        }
-    };
+) -> Result<SaoConnectionStatus, String> {
+    let core = state.lock().await;
     let config = core.sao_config();
     let birth = core.birth();
-    SaoConnectionStatus {
+    Ok(SaoConnectionStatus {
         configured: config.is_some(),
         base_url: config.map(|c| c.base_url.clone()),
         agent_id: birth
@@ -121,7 +105,7 @@ fn sao_connection_status(
         ego_model: birth.and_then(|b| b.agent.default_ego_model.clone()),
         birthed_at: birth.map(|b| b.birthed_at.to_rfc3339()),
         policy_version: birth.map(|b| b.policy.version),
-    }
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -135,7 +119,7 @@ struct ApplyConfigResult {
 /// portable fallback), then re-run bootstrap and hot-swap the OrionCore so the user
 /// doesn't have to restart the app.
 #[tauri::command]
-fn apply_bundle_config(
+async fn apply_bundle_config(
     json: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<orion::OrionCore>>,
@@ -168,17 +152,33 @@ fn apply_bundle_config(
     std::fs::write(&target, pretty)
         .map_err(|e| format!("Failed to write {}: {e}", target.display()))?;
 
-    let new_core = orion::OrionCore::from_bootstrap_with_app(
-        orion::bootstrap::OrionBootstrap::load(),
-        app.clone(),
-    );
-    let mut slot = state
-        .lock()
-        .map_err(|_| "Orion core state lock was poisoned".to_string())?;
-    *slot = new_core;
-    drop(slot);
+    let new_core = orion::OrionCore::from_bootstrap_with_app_blocking(app.clone());
+    {
+        let mut slot = state.lock().await;
+        *slot = new_core;
+    }
 
-    let status = sao_connection_status(state);
+    // Re-read connection status under a fresh lock acquisition.
+    let status = {
+        let core = state.lock().await;
+        let config = core.sao_config();
+        let birth = core.birth();
+        SaoConnectionStatus {
+            configured: config.is_some(),
+            base_url: config.map(|c| c.base_url.clone()),
+            agent_id: birth
+                .map(|b| b.agent.id.to_string())
+                .or_else(|| config.and_then(|c| c.agent_id.map(|id| id.to_string()))),
+            birthed: birth.is_some(),
+            agent_name: birth.map(|b| b.agent.name.clone()),
+            owner_username: birth.and_then(|b| b.owner.username.clone()),
+            provider: birth.and_then(|b| b.agent.default_provider.clone()),
+            id_model: birth.and_then(|b| b.agent.default_id_model.clone()),
+            ego_model: birth.and_then(|b| b.agent.default_ego_model.clone()),
+            birthed_at: birth.map(|b| b.birthed_at.to_rfc3339()),
+            policy_version: birth.map(|b| b.policy.version),
+        }
+    };
     Ok(ApplyConfigResult {
         written_to: target.display().to_string(),
         status,
@@ -205,10 +205,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
-            let core = orion::OrionCore::from_bootstrap_with_app(
-                orion::bootstrap::OrionBootstrap::load(),
-                handle,
-            );
+            let core = orion::OrionCore::from_bootstrap_with_app_blocking(handle);
             app.manage(Mutex::new(core));
             Ok(())
         })
