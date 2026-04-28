@@ -1,6 +1,6 @@
 # OrionII
 
-OrionII is a Windows-first Tauri + React desktop companion for the Phoenix Project Orion line.
+OrionII is a Windows-first Tauri + React desktop companion runtime.
 It runs locally with durable JSON-backed identity, a bicameral Id/Ego pipeline, document
 indexing, and routes every model call through SAO's LLM proxy — entity tokens are SAO-issued,
 provider keys never live on the entity's disk.
@@ -40,7 +40,7 @@ On every launch, OrionII calls `GET /api/orion/birth` to fetch live agent metada
 scopes, current policy, and personality seed. Admin changes in SAO take effect on the next
 launch with no re-bundling.
 
-The status card at the top of the window shows one of three modes:
+The agent cockpit at the top of the window shows one of three modes:
 
 - **birthed** — live SAO connection, real LLM responses; shows owner, provider, models,
   birthed-at.
@@ -85,8 +85,7 @@ This is the artifact SAO's installer-source registry serves. Either:
 ## Project Layout
 
 - `src/` — React frontend.
-  - `App.tsx` — chat UI, SAO sync controls, **Enroll with SAO** paste panel, three-mode status
-    card.
+  - `App.tsx` — agent cockpit, chat UI, SAO sync controls, enrollment notice, and diagnostics.
 - `src-tauri/` — Tauri shell + Rust Orion core.
   - `src/orion/bootstrap.rs` — anchor loader (config.json or env) + birth fetch.
   - `src/orion/birth.rs` — `GET /api/orion/birth` client.
