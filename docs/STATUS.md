@@ -40,13 +40,14 @@ now the packaged durable bus transport behind `bus_transport`; release MSI build
   responsive offline. The status card shows "Degraded fallback" when this happens.
 
 ### UI
-- Three-mode status header: **birthed** (live SAO), **anchor only** (config loaded but birth
-  failed), **offline** (no anchor).
-- Birthed view shows owner / provider / id-model / ego-model / birthed-at + policy version.
-- **Enroll with SAO** yellow panel — legacy/manual fallback for pasting bundle JSON. The primary
-  non-technical path is SAO's downloaded ZIP: double-click `Install-OrionII.cmd`, which writes
+- Agent cockpit header: the connected SAO agent name is the primary title, with short agent-id
+  and unenrolled fallbacks for anchor-only/offline states.
+- Birthed view shows owner / provider / id-model / ego-model / birthed-at + policy version in
+  diagnostics, while chat remains the main workspace.
+- Enrollment notice handles anchor-only and offline states. The primary non-technical path is
+  SAO's downloaded ZIP: double-click `Install-OrionII.cmd`, which writes
   `%APPDATA%\OrionII\config.json`, runs the MSI, and starts OrionII.
-- Existing chat + SAO sync controls (Refresh policy, Ship egress) preserved.
+- Existing event-driven chat + SAO sync controls (Refresh policy, Ship egress) preserved.
 
 ### Operational
 - Egress payloads stamp `clientVersion` (OrionII semver) on every batch.
@@ -81,8 +82,8 @@ now the packaged durable bus transport behind `bus_transport`; release MSI build
   for trust UX.
 - **Deep-link enrollment** — `orion://enroll?token=...` URL handler so the SAO bundle page can
   one-click enroll an installed OrionII without paste/file-drop.
-- **First-run UX polish** — make the Enroll panel even more discoverable (e.g., focus the
-  textarea on launch when offline).
+- **Deep-link enrollment polish** — pair the cockpit enrollment notice with a future
+  `orion://enroll?token=...` one-click flow.
 - **Live NATS durability UAT** — verify restart replay and supervisor crash behavior with the
   packaged `nats-server` sidecar.
 - **Iggy adapter hardening** — optional path only; official Windows server convenience binaries
