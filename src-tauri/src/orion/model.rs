@@ -183,7 +183,6 @@ impl ModelRouter {
         }
     }
 
-    #[cfg(test)]
     pub fn config(&self) -> &ModelConfig {
         &self.config
     }

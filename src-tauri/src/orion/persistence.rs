@@ -87,16 +87,26 @@ pub struct FilePersistence {
 
 impl FilePersistence {
     pub fn open_default() -> Self {
-        let base = std::env::current_dir()
-            .unwrap_or_else(|_| std::env::temp_dir())
-            .join(".orionii");
+        Self::open_default_with_identity(None)
+    }
 
-        Self::open(base).unwrap_or_else(|_| Self {
-            path: fallback_state_path(),
-            state: LocalState::default(),
+    pub fn open_default_with_identity(assigned_orion_id: Option<uuid::Uuid>) -> Self {
+        let base = default_data_dir();
+        migrate_legacy_state_if_needed(&base);
+
+        Self::open_with_identity(base, assigned_orion_id).unwrap_or_else(|_| {
+            let mut state = LocalState::default();
+            if let Some(id) = assigned_orion_id {
+                state.identity.identity.orion_id = id;
+            }
+            Self {
+                path: fallback_state_path(),
+                state,
+            }
         })
     }
 
+    #[allow(dead_code)]
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, PersistenceError> {
         Self::open_with_identity(data_dir, None)
     }
@@ -259,6 +269,49 @@ fn fallback_state_path() -> PathBuf {
     std::env::temp_dir()
         .join("orionii")
         .join("orion_state_fallback.json")
+}
+
+fn default_data_dir() -> PathBuf {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata).join("OrionII").join(".orionii");
+    }
+
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join(".orionii")
+}
+
+fn migrate_legacy_state_if_needed(target_dir: &Path) {
+    let target = target_dir.join("orion_state.json");
+    if target.exists() {
+        return;
+    }
+
+    let legacy = std::env::current_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join(".orionii")
+        .join("orion_state.json");
+    if legacy == target || !legacy.exists() {
+        return;
+    }
+
+    if let Some(parent) = target.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!(
+                "[OrionII persistence] could not prepare APPDATA state directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+    }
+
+    if let Err(error) = fs::copy(&legacy, &target) {
+        eprintln!(
+            "[OrionII persistence] could not migrate legacy state from {} to {}: {error}",
+            legacy.display(),
+            target.display()
+        );
+    }
 }
 
 #[cfg(test)]

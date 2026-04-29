@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::orion::identity::IdentityState;
+use crate::orion::charter::Charter;
 
 pub mod iggy;
 pub mod inmem;
@@ -204,11 +204,16 @@ pub trait EventBus: Send + Sync {
 /// Shared, owning handle to the bus.
 pub type SharedBus = Arc<dyn EventBus>;
 
-/// Phase 1 surrogate for `soul_ref`. SAO does not yet ship a signed
-/// `soul.md` blob at birth — when it does, replace this with
-/// `hex(blake3(soul_md_bytes))` in this single helper.
-pub fn current_soul_ref(identity: &IdentityState) -> String {
-    // TODO(soul-md-hash): replace with hex(blake3(soul_md_bytes)) once SAO
-    // ships a signed soul.md blob at birth and the entity caches it.
-    format!("{}:v{}", identity.identity.orion_id, identity.version)
+/// Content-addressed reference to the charter the entity is operating
+/// under. Returns `blake3:<hex>` over the bytes of the local `charter.md`.
+/// Every `Envelope::new` callsite computes this through here, so a charter
+/// amendment is visible from the event log alone — the version-violence
+/// guardrail expressed as a property of every event on the bus.
+///
+/// Pre-commissioning the charter is a placeholder, so `soul_ref` is a
+/// stable, deterministic hash even before SAO has issued a birth
+/// certificate. Post-commissioning it's the hash of the SAO-counter-signed
+/// charter; no other shape change is required at any callsite.
+pub fn current_soul_ref(charter: &Charter) -> String {
+    format!("blake3:{}", charter.hash())
 }

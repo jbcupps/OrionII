@@ -32,6 +32,7 @@ older clients.
 {
   "sao_base_url":      "http://localhost:3100",
   "agent_id":          "1c9d0fb8-0b2c-4c1e-99a7-...",
+  "agent_name":        "abigail-main",
   "agent_token":       "eyJhbGciOiJIUzI1NiJ9...<JWT>",
   "client_version_min": "0.1.0",
   "fallback": {
@@ -71,10 +72,11 @@ In order:
 
 ### What the bundle changes at runtime
 
-- **Identity adoption** — On first launch (no `orion_state.json` yet), `CompanionIdentity` adopts
-  the bundle's `agent_id` as its `orion_id`. If a state file already exists with a different id,
-  the persisted id wins and a warning is logged (collision = user reinstalled into a different
-  bundle).
+- **Identity adoption** — On first launch (no APPDATA `orion_state.json` yet),
+  `CompanionIdentity` adopts the bundle's `agent_id` as its `orion_id`. If a state file already
+  exists with a different id, the persisted id wins and a warning is logged (collision = user
+  reinstalled into a different bundle). Older working-directory `.orionii` state is copied into
+  `%APPDATA%\OrionII\.orionii\orion_state.json` once when the APPDATA file is missing.
 - **Model router** — `ModelProviderKind::SaoProxyWithFallback` is selected. Id/Ego prompts go to
   `POST {sao_base_url}/api/llm/generate` with `Authorization: Bearer <agent_token>`. The body
   carries `provider` and `model`; SAO dispatches to the right upstream (OpenAI / Anthropic / Grok
