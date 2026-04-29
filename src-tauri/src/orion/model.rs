@@ -54,8 +54,15 @@ pub struct ModelConfig {
     pub ollama_base_url: String,
     pub id_model: String,
     pub ego_model: String,
-    pub id_temperature: f32,
-    pub ego_temperature: f32,
+    /// Optional sampling temperature override for the Id role. When `None`, OrionII
+    /// omits the field from the SAO proxy request and lets the upstream model use its
+    /// default. Required for GPT-5.x and reasoning models that reject any custom value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_temperature: Option<f32>,
+    /// Optional sampling temperature override for the Ego role. Same semantics as
+    /// `id_temperature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ego_temperature: Option<f32>,
     pub timeout_ms: u64,
     /// Provider key SAO uses to dispatch (`openai`, `anthropic`, `ollama`).
     /// Only meaningful when `provider == SaoProxyWithFallback`.
@@ -69,8 +76,8 @@ impl Default for ModelConfig {
             ollama_base_url: "http://127.0.0.1:11434".to_string(),
             id_model: "llama3.2".to_string(),
             ego_model: "llama3.2".to_string(),
-            id_temperature: 0.35,
-            ego_temperature: 0.2,
+            id_temperature: None,
+            ego_temperature: None,
             timeout_ms: 20_000,
             sao_provider: "ollama".to_string(),
         }
@@ -409,7 +416,7 @@ impl OllamaModelProvider {
         model: &str,
         system: String,
         prompt: String,
-        temperature: f32,
+        temperature: Option<f32>,
     ) -> ModelResult<String> {
         if prompt.trim().is_empty() {
             return Err(ModelError::PromptRejected("empty prompt".to_string()));
@@ -515,7 +522,8 @@ struct OllamaGenerateRequest<'a> {
 
 #[derive(Serialize)]
 struct OllamaOptions {
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -570,7 +578,8 @@ struct SaoProxyRequest<'a> {
     model: &'a str,
     system: &'a str,
     prompt: &'a str,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     role: &'a str,
 }
 
@@ -602,7 +611,7 @@ impl SaoProxyProvider {
         model: &str,
         system: String,
         prompt: String,
-        temperature: f32,
+        temperature: Option<f32>,
     ) -> ModelResult<String> {
         if prompt.trim().is_empty() {
             return Err(ModelError::PromptRejected("empty prompt".to_string()));
