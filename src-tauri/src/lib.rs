@@ -460,7 +460,6 @@ async fn commission_qna(
         "role": "commissioning",
         "system": "You produce a Markdown business charter for an OrionII entity. Given the operator's free-form description, return a single Markdown document that names the role, states its purpose in 1-2 sentences, lists the systems and outputs in scope, and captures explicit boundaries (what the agent must never do without the operator's approval). Do not include any preamble — the response is the charter body itself.",
         "prompt": description,
-        "temperature": 0.3,
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
