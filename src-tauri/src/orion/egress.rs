@@ -17,6 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use tauri::async_runtime::JoinHandle;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
@@ -35,7 +36,7 @@ pub fn spawn(
             match rx.recv().await {
                 Ok(env) => handle_outbound(&persistence, &shipper, env).await,
                 Err(RecvError::Lagged(skipped)) => {
-                    eprintln!("[egress] lagged on EgressOutbound, skipped {skipped} envelopes");
+                    warn!(target: "orion::egress", skipped, "lagged on EgressOutbound");
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -70,13 +71,13 @@ async fn handle_outbound(
     {
         let mut p = persistence.lock().expect("persistence mutex poisoned");
         if let Err(error) = p.enqueue_sao(record) {
-            eprintln!("[egress] failed to enqueue SAO event: {error}");
+            error!(target: "orion::egress", %error, "failed to enqueue SAO event");
             return;
         }
     }
 
     if let Err(error) = ship_pending_with_shipper(persistence, shipper).await {
-        eprintln!("[egress] failed to ship pending SAO egress: {error}");
+        error!(target: "orion::egress", %error, "failed to ship pending SAO egress");
     }
 }
 

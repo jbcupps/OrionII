@@ -22,7 +22,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -502,6 +503,10 @@ h2 {
   color: #fde68a;
 }
 
+.enrollment-notice strong {
+  color: #fef3c7;
+}
+
 .birth-error {
   min-width: 0;
 }
@@ -512,6 +517,74 @@ h2 {
   overflow-x: auto;
   margin-top: 0.35rem;
   white-space: pre-wrap;
+}
+
+.config-apply {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.config-apply label {
+  color: #fef3c7;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.config-apply textarea {
+  min-height: 7rem;
+  resize: vertical;
+  border: 1px solid rgba(250, 204, 21, 0.26);
+  border-radius: 8px;
+  padding: 0.75rem;
+  color: #f8fafc;
+  background: rgba(15, 23, 42, 0.6);
+  outline: none;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.config-apply textarea:focus {
+  border-color: rgba(250, 204, 21, 0.68);
+  box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.12);
+}
+
+.config-apply-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: center;
+}
+
+.config-apply-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  min-height: 2.35rem;
+  border: 1px solid rgba(250, 204, 21, 0.32);
+  border-radius: 8px;
+  padding: 0 0.75rem;
+  color: #241f0c;
+  background: #fde68a;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.config-apply-row button:disabled,
+.config-apply textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.config-apply-row small {
+  min-width: 0;
+  overflow: hidden;
+  color: #fde68a;
+  font-size: 0.74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .detail-list {
@@ -602,7 +675,375 @@ h2 {
     grid-template-columns: 1fr;
   }
 
+  .config-apply-row {
+    grid-template-columns: 1fr;
+  }
+
   .composer button {
     width: 100%;
   }
+}
+
+/* ===== Commissioning surface ===== */
+
+.commissioning-shell {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 48px 32px 80px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.commissioning-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.commissioning-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #1f2a44, #25304d);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6ee7b7;
+}
+
+.commissioning-eyebrow {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #93a3c1;
+}
+
+.commissioning-header h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: -0.01em;
+}
+
+.commissioning-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: rgba(244, 114, 182, 0.12);
+  border: 1px solid rgba(244, 114, 182, 0.3);
+  color: #fbcfe8;
+  padding: 12px 14px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+.commissioning-error span {
+  flex: 1;
+}
+
+.commissioning-error-dismiss {
+  background: transparent;
+  border: 1px solid rgba(244, 114, 182, 0.4);
+  color: #fbcfe8;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.commissioning-error-inline {
+  color: #fbcfe8;
+}
+
+.commissioning-panel {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 16px;
+  padding: 28px 28px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.commissioning-panel h2 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: -0.005em;
+}
+
+.commissioning-panel p {
+  margin: 0;
+  color: #cbd5e1;
+  line-height: 1.55;
+}
+
+.commissioning-note {
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.commissioning-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #94a3b8;
+}
+
+.commissioning-spin {
+  animation: commissioning-rotate 1s linear infinite;
+}
+
+@keyframes commissioning-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.commissioning-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.commissioning-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #6ee7b7;
+  color: #0b1120;
+  border: 0;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.commissioning-primary[disabled] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.commissioning-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  color: #cbd5e1;
+  border: 1px solid #334155;
+  padding: 9px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.commissioning-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.commissioning-key-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: #111c33;
+  border: 1px solid #1e293b;
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.commissioning-key-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: #1e293b;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6ee7b7;
+}
+
+.commissioning-key-row span {
+  display: block;
+  font-size: 13px;
+  color: #93a3c1;
+}
+
+.commissioning-key-row code {
+  display: block;
+  font-size: 13px;
+  color: #f1f5f9;
+  word-break: break-all;
+}
+
+.commissioning-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-top: 8px;
+}
+
+@media (max-width: 720px) {
+  .commissioning-role-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.commissioning-role-card {
+  background: #111c33;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  padding: 16px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  cursor: pointer;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+
+.commissioning-role-card:hover {
+  border-color: #6ee7b7;
+  transform: translateY(-1px);
+}
+
+.commissioning-role-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.commissioning-role-card h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.commissioning-role-card header span {
+  font-size: 12px;
+  color: #93a3c1;
+}
+
+.commissioning-role-card p {
+  margin: 0;
+  font-size: 14px;
+  color: #cbd5e1;
+}
+
+.commissioning-qna-card {
+  background: #111c33;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.commissioning-qna-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.commissioning-qna-header h3 {
+  margin: 0;
+  font-size: 15px;
+  flex: 1;
+}
+
+.commissioning-qna-header span {
+  font-size: 12px;
+  color: #93a3c1;
+}
+
+.commissioning-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.commissioning-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+
+.commissioning-form input,
+.commissioning-form textarea,
+.commissioning-qna-textarea,
+.commissioning-charter-textarea,
+.commissioning-panel textarea {
+  background: #0b1120;
+  border: 1px solid #1e293b;
+  color: #f1f5f9;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  resize: vertical;
+}
+
+.commissioning-charter-textarea {
+  min-height: 320px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.commissioning-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.commissioning-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #94a3b8;
+  font-size: 14px;
+}
+
+.commissioning-step.active {
+  color: #f1f5f9;
+}
+
+.commissioning-step.done {
+  color: #6ee7b7;
+}
+
+.commissioning-step-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid #334155;
+}
+
+.commissioning-summary {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  background: #111c33;
+  border: 1px solid #1e293b;
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.commissioning-summary span {
+  font-size: 12px;
+  color: #93a3c1;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.commissioning-summary code {
+  font-size: 13px;
+  color: #f1f5f9;
+  word-break: break-all;
 }

@@ -53,7 +53,7 @@ When SAO begins shipping a signed `soul.md` at birth and the entity caches it, r
 
 **−** One day of upfront refactor. Took the form of: collapsing the 11-topic legacy vocabulary to the canonical 8; wrapping `FilePersistence` and `ModelRouter` in `Arc<Mutex<…>>` / `Arc<…>` to share between subscribers; inverting the UI to consume `ego.action` events instead of awaiting command returns.
 
-**−** The integration test in `service.rs` (`mentor_input_round_trips_to_ego_action`) is currently `#[ignore]`d. The blocker is `reqwest::blocking::Client` inside `OllamaModelProvider` and `SaoProxyProvider` — it carries an internal tokio runtime that panics when dropped inside an outer async context. Resolving this means converting those providers to `reqwest`'s async client, which is **out of scope** for this ADR but is the most natural follow-up.
+**+** The integration test in `service.rs` (`mentor_input_round_trips_to_ego_action`) is active. `OllamaModelProvider` and `SaoProxyProvider` use async `reqwest::Client`, so the model layer no longer carries a nested blocking runtime.
 
 ## Out of scope (separate tickets)
 
@@ -69,7 +69,7 @@ When SAO begins shipping a signed `soul.md` at birth and the entity caches it, r
 End-to-end, in order:
 
 1. `cargo check` in `src-tauri/` — compiles clean. The topic rename surfaces every legacy callsite as a compile error; all are fixed.
-2. `cargo test --lib` — 24 passing, 0 ignored. The round-trip test now verifies both `ego.action` and the correlated `egress.outbound` audit envelope.
+2. `cargo test --lib` — the round-trip test verifies `mentor.input` → `ego.action`, the correlated `egress.outbound` audit envelope, and the persistence journal counters.
 3. `npm run build` — TypeScript + Vite build clean.
 4. `npm run tauri dev` — type "hello" in the chat composer:
    - User message appears immediately (from `send_chat_message` ack).

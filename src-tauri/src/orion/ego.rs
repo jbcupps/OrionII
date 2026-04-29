@@ -1,11 +1,21 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tauri::async_runtime::JoinHandle;
+use tokio::time::error::Elapsed;
+use tracing::{error, info, warn};
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
 use crate::orion::ethics::{EthicsOverlay, EthicsOverlaySource};
 use crate::orion::model::{ModelPrompt, ModelProvider, ModelRouter};
 use crate::orion::payloads::{EgoActionPayload, IdReactionPayload};
+
+/// Upper bound on the entire Ego model call. The underlying `reqwest`
+/// client already has its own per-request timeout; this is defence in depth
+/// so a wedged provider can never pin the Ego subscriber forever — at the
+/// deadline we publish a degraded `EgoAction` and the chat surface keeps
+/// flowing.
+const EGO_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct EgoRuntime;
@@ -20,16 +30,30 @@ impl EgoRuntime {
         ethics: &EthicsOverlay,
         model: &dyn ModelProvider,
     ) -> String {
-        model
-            .generate_ego_response(prompt, ethics)
-            .await
-            .unwrap_or_else(|error| {
-                format!(
-                    "Orion is operating in degraded local cognition mode. I heard: \"{}\"\n\nModel error: {}",
-                    prompt.user_query, error
-                )
-            })
+        match tokio::time::timeout(
+            EGO_MODEL_CALL_TIMEOUT,
+            model.generate_ego_response(prompt, ethics),
+        )
+        .await
+        {
+            Ok(Ok(text)) => text,
+            Ok(Err(error)) => degraded_text(&prompt.user_query, &error.to_string()),
+            Err(Elapsed { .. }) => degraded_text(
+                &prompt.user_query,
+                &format!(
+                    "model call timed out after {}s",
+                    EGO_MODEL_CALL_TIMEOUT.as_secs()
+                ),
+            ),
+        }
     }
+}
+
+fn degraded_text(user_query: &str, detail: &str) -> String {
+    format!(
+        "Orion is operating in degraded local cognition mode. I heard: \"{}\"\n\nModel error: {}",
+        user_query, detail
+    )
 }
 
 /// Spawn the Ego subscriber task.
@@ -40,7 +64,7 @@ pub fn spawn(bus: SharedBus, model: Arc<ModelRouter>) -> JoinHandle<()> {
             match rx.recv().await {
                 Ok(env) => handle_id_reaction(&bus, &model, env).await,
                 Err(RecvError::Lagged(skipped)) => {
-                    eprintln!("[ego-subscriber] lagged on IdReaction, skipped {skipped} envelopes");
+                    warn!(target: "orion::ego", skipped, "lagged on IdReaction");
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -50,7 +74,11 @@ pub fn spawn(bus: SharedBus, model: Arc<ModelRouter>) -> JoinHandle<()> {
 
 async fn handle_id_reaction(bus: &SharedBus, model: &Arc<ModelRouter>, env: Envelope) {
     let Ok(reaction) = serde_json::from_value::<IdReactionPayload>(env.payload.clone()) else {
-        eprintln!("[ego-subscriber] dropped malformed IdReaction payload");
+        warn!(
+            target: "orion::ego",
+            correlation_id = ?env.correlation_id,
+            "dropped malformed IdReaction payload"
+        );
         return;
     };
 
@@ -88,8 +116,19 @@ async fn handle_id_reaction(bus: &SharedBus, model: &Arc<ModelRouter>, env: Enve
         correlation_id,
         value,
     );
+    info!(
+        target: "orion::ego",
+        correlation_id = ?correlation_id,
+        response_bytes = action.response_text.len(),
+        "ego_action_published"
+    );
     if let Err(error) = bus.publish(envelope).await {
-        eprintln!("[ego-subscriber] failed to publish EgoAction: {error}");
+        error!(
+            target: "orion::ego",
+            correlation_id = ?correlation_id,
+            %error,
+            "failed to publish EgoAction"
+        );
     }
 
     let outbound = Envelope::new(
@@ -104,6 +143,11 @@ async fn handle_id_reaction(bus: &SharedBus, model: &Arc<ModelRouter>, env: Enve
         }),
     );
     if let Err(error) = bus.publish(outbound).await {
-        eprintln!("[ego-subscriber] failed to publish EgressOutbound audit: {error}");
+        error!(
+            target: "orion::ego",
+            correlation_id = ?correlation_id,
+            %error,
+            "failed to publish EgressOutbound audit"
+        );
     }
 }

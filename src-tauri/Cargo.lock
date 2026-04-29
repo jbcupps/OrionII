@@ -3724,6 +3724,7 @@ version = "0.1.1"
 dependencies = [
  "async-nats",
  "async-trait",
+ "blake3",
  "chrono",
  "dashmap",
  "futures-util",
@@ -3736,6 +3737,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "toml 0.8.2",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

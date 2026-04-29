@@ -138,7 +138,7 @@ Phase 2.1 work:
 ## Verification
 
 1. **Compile clean**: `cargo check` clean as of this commit.
-2. **In-memory path still passes**: `cargo test --lib` — 24 tests pass, 0 ignored.
+2. **In-memory path still passes**: `cargo test --lib`.
 3. **Iggy compile path verified**: `bus/iggy.rs`, `iggy_auth.rs`, `iggy_supervisor.rs` all compile-clean with the iggy 0.10 client; the iggy crate's own dependencies (turso, openssl-src) are *not* pulled in by us — only the client surface.
 4. **End-to-end smoke** (release bundle path):
    - Provide a vetted Windows `iggy-server.exe` via `ORIONII_IGGY_SERVER` or

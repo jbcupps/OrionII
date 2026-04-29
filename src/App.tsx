@@ -1,7 +1,9 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+
+import Commissioning, { CommissioningStateView } from "./Commissioning";
 import {
   Activity,
   AlertTriangle,
@@ -59,6 +61,7 @@ type CompanionStatusReport = {
   memoryCount: number;
   security: SecurityHealth;
   modelStatus: ModelStatus[];
+  lastEgoActionAt: string | null;
 };
 
 type TranscriptMessage = {
@@ -81,6 +84,7 @@ type SaoConnectionStatus = {
   agentId: string | null;
   birthed: boolean;
   agentName: string | null;
+  agentNameSource: "birth" | "bundle" | "tokenClaim" | "none";
   ownerUsername: string | null;
   provider: string | null;
   idModel: string | null;
@@ -88,10 +92,16 @@ type SaoConnectionStatus = {
   birthedAt: string | null;
   policyVersion: number | null;
   birthError: string | null;
+  birthStatusCode: number | null;
   busTransport: string;
 };
 
 type ConnectionMode = "birthed" | "anchor" | "offline";
+
+type ApplyConfigResult = {
+  writtenTo: string;
+  status: SaoConnectionStatus;
+};
 
 const EMPTY_STATUS: CompanionStatusReport = {
   companionId: "not loaded",
@@ -104,7 +114,8 @@ const EMPTY_STATUS: CompanionStatusReport = {
     checkedAt: "",
     remediation: null
   },
-  modelStatus: []
+  modelStatus: [],
+  lastEgoActionAt: null
 };
 
 const EMPTY_CONNECTION: SaoConnectionStatus = {
@@ -113,6 +124,7 @@ const EMPTY_CONNECTION: SaoConnectionStatus = {
   agentId: null,
   birthed: false,
   agentName: null,
+  agentNameSource: "none",
   ownerUsername: null,
   provider: null,
   idModel: null,
@@ -120,10 +132,18 @@ const EMPTY_CONNECTION: SaoConnectionStatus = {
   birthedAt: null,
   policyVersion: null,
   birthError: null,
+  birthStatusCode: null,
   busTransport: "in_memory"
 };
 
 const ORION_EGO_ACTION_EVENT = "orion://ego/action";
+
+/// Upper bound on how long the chat surface waits for a reply on
+/// `orion://ego/action` before flipping `isSending` off and surfacing an
+/// error. Slightly longer than the Rust-side `EGO_MODEL_CALL_TIMEOUT` so
+/// the degraded fallback usually wins the race; if neither arrives the
+/// operator at least sees something instead of a silent infinite spinner.
+const ORION_REPLY_TIMEOUT_MS = 35_000;
 
 function App() {
   const [draft, setDraft] = useState("");
@@ -138,34 +158,66 @@ function App() {
     useState<SaoConnectionStatus>(EMPTY_CONNECTION);
   const [syncStatus, setSyncStatus] = useState("SAO sync not checked");
   const [lastShipReport, setLastShipReport] = useState<ShipReport | null>(null);
+  const [bundleJson, setBundleJson] = useState("");
+  const [bundleApplyStatus, setBundleApplyStatus] = useState<string | null>(null);
+  const [isApplyingBundle, setIsApplyingBundle] = useState(false);
+  const [pendingCorrelationId, setPendingCorrelationId] = useState<string | null>(null);
+  const [commissioningView, setCommissioningView] =
+    useState<CommissioningStateView | null>(null);
+  const [isCheckingEnrollment, setIsCheckingEnrollment] = useState(true);
+  const [commissioningError, setCommissioningError] = useState<string | null>(null);
 
   const displayAgentTitle = useMemo(
     () => getDisplayAgentTitle(saoConnection),
     [saoConnection]
   );
   const connectionMode = getConnectionMode(saoConnection);
+  const activeCommissioningView = useMemo(
+    () => getActiveCommissioningView(saoConnection, commissioningView),
+    [saoConnection, commissioningView]
+  );
   const canSend = useMemo(
     () => draft.trim().length > 0 && !isSending,
     [draft, isSending]
   );
 
-  useEffect(() => {
-    invoke<SaoConnectionStatus>("sao_connection_status")
-      .then((connection) => {
-        setSaoConnection(connection);
-        setSyncStatus(describeConnectionStatus(connection));
-      })
-      .catch((cause) => {
-        setSyncStatus("SAO status unavailable");
-        setError(String(cause));
-      });
-
-    invoke<CompanionStatusReport>("companion_status")
+  const refreshCompanionStatus = useCallback(async () => {
+    return invoke<CompanionStatusReport>("companion_status")
       .then(setCompanionStatus)
       .catch(() => {
         // Non-fatal: status will populate after the first ego.action event.
       });
   }, []);
+
+  const refreshEnrollment = useCallback(async () => {
+    setIsCheckingEnrollment(true);
+    setCommissioningError(null);
+
+    try {
+      const connection = await invoke<SaoConnectionStatus>("sao_connection_status");
+      setSaoConnection(connection);
+      setSyncStatus(describeConnectionStatus(connection));
+    } catch (cause) {
+      const message = formatError(cause);
+      setSyncStatus("SAO status unavailable");
+      setError(message);
+    }
+
+    try {
+      const view = await invoke<CommissioningStateView>("commissioning_state");
+      setCommissioningView(view);
+    } catch (cause) {
+      setCommissioningView(null);
+      setCommissioningError(formatError(cause));
+    } finally {
+      setIsCheckingEnrollment(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshEnrollment();
+    void refreshCompanionStatus();
+  }, [refreshEnrollment, refreshCompanionStatus]);
 
   useEffect(() => {
     document.title = displayAgentTitle;
@@ -192,6 +244,9 @@ function App() {
         }
       ]);
       setIsSending(false);
+      setPendingCorrelationId((current) =>
+        current && payload.correlationId === current ? null : current
+      );
       setStatus("Ego action received");
 
       // Refresh persistence-derived status after each ego response.
@@ -200,12 +255,38 @@ function App() {
         .catch(() => {
           // Non-fatal.
         });
+      window.setTimeout(() => {
+        invoke<CompanionStatusReport>("companion_status")
+          .then(setCompanionStatus)
+          .catch(() => {});
+      }, 100);
     });
 
     return () => {
       unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
     };
   }, []);
+
+  // Watchdog: if a sent message has no `orion://ego/action` event within
+  // ORION_REPLY_TIMEOUT_MS, surface the failure instead of leaving the
+  // spinner up forever. The Rust side's EGO_MODEL_CALL_TIMEOUT (30s) wraps
+  // the model call so a degraded fallback should arrive within ~30s; this
+  // 35s timer is a hard floor for the operator UX.
+  useEffect(() => {
+    if (!pendingCorrelationId) {
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      setError(
+        `No agent reply within ${Math.round(ORION_REPLY_TIMEOUT_MS / 1000)}s for correlation ${pendingCorrelationId}. The model layer or bus may be wedged — check the diagnostics panel and Tauri logs.`
+      );
+      setStatus("Reply watchdog tripped");
+      setIsSending(false);
+      setPendingCorrelationId(null);
+    }, ORION_REPLY_TIMEOUT_MS);
+
+    return () => window.clearTimeout(handle);
+  }, [pendingCorrelationId]);
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -234,8 +315,9 @@ function App() {
           correlationId: ack.correlationId
         }
       ]);
+      setPendingCorrelationId(ack.correlationId);
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
+      const message = formatError(cause);
       setError(message);
       setStatus("Local round-trip failed");
       setIsSending(false);
@@ -254,7 +336,7 @@ function App() {
       }));
       setSyncStatus(`Policy refreshed to v${version}`);
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
+      const message = formatError(cause);
       setError(message);
       setSyncStatus("Policy refresh failed");
     } finally {
@@ -277,12 +359,72 @@ function App() {
         `Egress shipped: ${report.acked}/${report.attempted} acked, ${report.failed} failed`
       );
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
+      const message = formatError(cause);
       setError(message);
       setSyncStatus("Egress ship failed");
     } finally {
       setIsSyncing(false);
     }
+  }
+
+  async function applyBundleConfig() {
+    if (!bundleJson.trim() || isApplyingBundle) {
+      return;
+    }
+
+    setError(null);
+    setBundleApplyStatus("Applying enrollment config");
+    setIsApplyingBundle(true);
+    try {
+      const result = await invoke<ApplyConfigResult>("apply_bundle_config", {
+        json: bundleJson
+      });
+      setSaoConnection(result.status);
+      setSyncStatus(describeConnectionStatus(result.status));
+      setBundleApplyStatus(`Config saved to ${result.writtenTo}`);
+      setBundleJson("");
+      await refreshEnrollment();
+      await refreshCompanionStatus();
+    } catch (cause) {
+      const message = formatError(cause);
+      setError(message);
+      setBundleApplyStatus("Config apply failed");
+    } finally {
+      setIsApplyingBundle(false);
+    }
+  }
+
+  // Commissioning gate: when the SAO bundle is configured but the agent
+  // has not been commissioned yet (or local state needs repair), show the
+  // commissioning surface instead of the cockpit. Once commissioning
+  // completes, the hot-swap inside `commission_finalize` flips
+  // birth.is_some()=true and `commissioning_state` reports
+  // "commissioned" — refreshEnrollment clears this branch and the
+  // operator lands on the chat cockpit.
+  if (isCheckingEnrollment) {
+    return <EnrollmentGatePending />;
+  }
+
+  if (commissioningError) {
+    return (
+      <CommissioningUnavailable
+        connection={saoConnection}
+        detail={commissioningError}
+        onRetry={refreshEnrollment}
+      />
+    );
+  }
+
+  if (activeCommissioningView) {
+    return (
+      <Commissioning
+        initial={activeCommissioningView}
+        onCommissioned={async () => {
+          await refreshEnrollment();
+          await refreshCompanionStatus();
+        }}
+      />
+    );
   }
 
   return (
@@ -322,7 +464,14 @@ function App() {
           />
 
           {connectionMode !== "birthed" ? (
-            <EnrollmentNotice connection={saoConnection} />
+            <EnrollmentNotice
+              bundleJson={bundleJson}
+              connection={saoConnection}
+              isApplying={isApplyingBundle}
+              onApply={applyBundleConfig}
+              onBundleJsonChange={setBundleJson}
+              status={bundleApplyStatus}
+            />
           ) : null}
 
           <DiagnosticsPanel
@@ -331,6 +480,77 @@ function App() {
           />
         </aside>
       </div>
+    </main>
+  );
+}
+
+function EnrollmentGatePending() {
+  return (
+    <main className="commissioning-shell">
+      <header className="commissioning-header">
+        <div className="commissioning-mark" aria-hidden="true">
+          <RefreshCw size={22} className="commissioning-spin" />
+        </div>
+        <div>
+          <span className="commissioning-eyebrow">OrionII enrollment</span>
+          <h1>Checking agent state</h1>
+        </div>
+      </header>
+      <section className="commissioning-panel">
+        <h2>Loading enrollment</h2>
+        <p className="commissioning-loading">
+          <RefreshCw size={16} className="commissioning-spin" /> Reading the local
+          SAO anchor and commissioning state...
+        </p>
+      </section>
+    </main>
+  );
+}
+
+function CommissioningUnavailable({
+  connection,
+  detail,
+  onRetry
+}: {
+  connection: SaoConnectionStatus;
+  detail: string;
+  onRetry: () => Promise<void>;
+}) {
+  const title = getDisplayAgentTitle(connection);
+
+  return (
+    <main className="commissioning-shell">
+      <header className="commissioning-header">
+        <div className="commissioning-mark" aria-hidden="true">
+          <AlertTriangle size={22} />
+        </div>
+        <div>
+          <span className="commissioning-eyebrow">OrionII enrollment</span>
+          <h1>Commissioning unavailable</h1>
+        </div>
+      </header>
+      <section className="commissioning-panel">
+        <h2>Runtime mismatch</h2>
+        <p>
+          This install found a SAO anchor for <strong>{title}</strong>, but
+          the local runtime could not open the commissioning command surface.
+          Install the latest OrionII bundle from SAO, then retry this check.
+        </p>
+        <details className="birth-error" open>
+          <summary>Command error</summary>
+          <code>{detail}</code>
+        </details>
+        <div className="commissioning-actions">
+          <button
+            type="button"
+            className="commissioning-primary"
+            onClick={() => void onRetry()}
+          >
+            <RefreshCw size={16} />
+            <span>Retry enrollment check</span>
+          </button>
+        </div>
+      </section>
     </main>
   );
 }
@@ -392,8 +612,8 @@ function HealthStrip({
       <HealthChip
         icon={BrainCircuit}
         label="Model"
-        tone={getModelTone(companionStatus.modelStatus)}
-        value={formatModelSummary(companionStatus.modelStatus)}
+        tone={getModelTone(companionStatus.modelStatus, connection)}
+        value={formatModelSummary(companionStatus.modelStatus, connection)}
       />
       <HealthChip
         icon={Route}
@@ -601,8 +821,23 @@ function ConnectionSummary({
   );
 }
 
-function EnrollmentNotice({ connection }: { connection: SaoConnectionStatus }) {
+function EnrollmentNotice({
+  bundleJson,
+  connection,
+  isApplying,
+  onApply,
+  onBundleJsonChange,
+  status
+}: {
+  bundleJson: string;
+  connection: SaoConnectionStatus;
+  isApplying: boolean;
+  onApply: () => void;
+  onBundleJsonChange: (value: string) => void;
+  status: string | null;
+}) {
   const configured = connection.configured;
+  const title = getDisplayAgentTitle(connection);
 
   return (
     <section className="panel enrollment-notice" aria-label="SAO enrollment">
@@ -615,10 +850,10 @@ function EnrollmentNotice({ connection }: { connection: SaoConnectionStatus }) {
       </div>
       {configured ? (
         <p>
-          This runtime found an enrollment anchor for agent{" "}
-          <code>{shortId(connection.agentId)}</code>, but SAO did not complete birth. Download
-          a fresh agent bundle from SAO and run <code>Install-OrionII.cmd</code> from the
-          extracted bundle so <code>config.json</code> is copied automatically.
+          This runtime found an enrollment anchor for <strong>{title}</strong>{" "}
+          <code>{shortId(connection.agentId)}</code>, but SAO did not complete birth.
+          Download a fresh agent bundle from SAO and run <code>Install-OrionII.cmd</code>,
+          or paste the bundle <code>config.json</code> here.
         </p>
       ) : (
         <p>
@@ -633,6 +868,28 @@ function EnrollmentNotice({ connection }: { connection: SaoConnectionStatus }) {
           <code>{connection.birthError}</code>
         </details>
       ) : null}
+      <div className="config-apply">
+        <label htmlFor="bundle-config">Bundle config</label>
+        <textarea
+          id="bundle-config"
+          spellCheck={false}
+          value={bundleJson}
+          onChange={(event) => onBundleJsonChange(event.target.value)}
+          placeholder='{"sao_base_url":"http://localhost:3100","agent_token":"..."}'
+          disabled={isApplying}
+        />
+        <div className="config-apply-row">
+          <button
+            type="button"
+            onClick={onApply}
+            disabled={isApplying || !bundleJson.trim()}
+          >
+            {isApplying ? <RefreshCw size={16} aria-hidden="true" /> : <Fingerprint size={16} aria-hidden="true" />}
+            <span>{isApplying ? "Applying" : "Apply config"}</span>
+          </button>
+          {status ? <small>{status}</small> : null}
+        </div>
+      </div>
     </section>
   );
 }
@@ -656,13 +913,23 @@ function DiagnosticsPanel({
 
       <dl className="detail-list">
         <DetailRow label="Owner" value={connection.ownerUsername ?? "not available"} />
+        <DetailRow label="Agent name" value={connection.agentName ?? "not available"} />
+        <DetailRow label="Name source" value={formatNameSource(connection.agentNameSource)} />
         <DetailRow label="Agent id" value={connection.agentId ?? "not assigned"} />
         <DetailRow label="Identity" value={companionStatus.companionId} />
         <DetailRow label="Provider" value={connection.provider ?? "fallback"} />
         <DetailRow label="Id model" value={connection.idModel ?? "fallback"} />
         <DetailRow label="Ego model" value={connection.egoModel ?? "fallback"} />
         <DetailRow label="Birthed" value={formatTimestamp(connection.birthedAt)} />
+        <DetailRow
+          label="Birth code"
+          value={connection.birthStatusCode ? String(connection.birthStatusCode) : "not available"}
+        />
         <DetailRow label="Messages" value={String(companionStatus.persistedMessages)} />
+        <DetailRow
+          label="Last reply"
+          value={formatTimestamp(companionStatus.lastEgoActionAt)}
+        />
         <DetailRow
           label="Security check"
           value={formatTimestamp(companionStatus.security.checkedAt)}
@@ -684,8 +951,27 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+function getActiveCommissioningView(
+  connection: SaoConnectionStatus,
+  view: CommissioningStateView | null
+): CommissioningStateView | null {
+  if (!connection.configured || connection.birthed) {
+    return null;
+  }
+
+  if (view && view.stage !== "commissioned" && view.stage !== "notConfigured") {
+    return view;
+  }
+
+  if (connection.birthStatusCode === 401 || connection.birthStatusCode === 403) {
+    return { stage: "needsTokenRefresh", agentName: connection.agentName };
+  }
+
+  return { stage: "firstLaunch" };
+}
+
 function getDisplayAgentTitle(connection: SaoConnectionStatus): string {
-  if (connection.birthed && connection.agentName?.trim()) {
+  if (connection.agentName?.trim()) {
     return connection.agentName.trim();
   }
 
@@ -728,9 +1014,15 @@ function describeConnectionStatus(connection: SaoConnectionStatus): string {
   }
 
   if (connection.configured) {
-    return connection.birthError
-      ? "Enrollment anchor loaded; SAO rejected birth"
-      : "Enrollment anchor loaded; SAO is unreachable";
+    if (connection.birthStatusCode === 401 || connection.birthStatusCode === 403) {
+      return "Enrollment anchor loaded; token rejected";
+    }
+
+    if (connection.birthError) {
+      return "Enrollment anchor loaded; birth failed";
+    }
+
+    return "Enrollment anchor loaded; SAO is unreachable";
   }
 
   return "Offline local mode; install from a SAO agent bundle to enroll";
@@ -746,7 +1038,9 @@ function getConnectionDetail(connection: SaoConnectionStatus): string {
   if (connection.configured) {
     return `Anchor target: ${connection.baseUrl ?? "unknown"}; agent ${shortId(
       connection.agentId
-    )}.`;
+    )}; provider ${connection.provider ?? "fallback"}; id ${
+      connection.idModel ?? "fallback"
+    }; ego ${connection.egoModel ?? "fallback"}.`;
   }
 
   return "No SAO anchor is configured yet. The runtime remains local-first until enrollment.";
@@ -764,8 +1058,20 @@ function shortId(id: string | null): string {
   return `${id.slice(0, 8)}...${id.slice(-4)}`;
 }
 
-function formatModelSummary(statuses: ModelStatus[]): string {
+function formatModelSummary(statuses: ModelStatus[], connection: SaoConnectionStatus): string {
+  if (
+    connection.configured &&
+    !connection.birthed &&
+    (connection.birthStatusCode === 401 || connection.birthStatusCode === 403)
+  ) {
+    return "Token rejected";
+  }
+
   if (statuses.length === 0) {
+    if (connection.configured && connection.provider) {
+      return `${connection.provider} ready`;
+    }
+
     return "not checked";
   }
 
@@ -782,9 +1088,20 @@ function formatModelSummary(statuses: ModelStatus[]): string {
   return "Fallback";
 }
 
-function getModelTone(statuses: ModelStatus[]): "good" | "warn" | "muted" | "neutral" {
+function getModelTone(
+  statuses: ModelStatus[],
+  connection: SaoConnectionStatus
+): "good" | "warn" | "muted" | "neutral" {
   if (statuses.some((status) => status.state === "healthy")) {
     return "good";
+  }
+
+  if (
+    connection.configured &&
+    !connection.birthed &&
+    (connection.birthStatusCode === 401 || connection.birthStatusCode === 403)
+  ) {
+    return "warn";
   }
 
   if (statuses.some((status) => status.state === "degraded")) {
@@ -822,6 +1139,14 @@ function formatBusLabel(value: string): string {
   return value.replace(/_/g, " ");
 }
 
+function formatNameSource(value: SaoConnectionStatus["agentNameSource"]): string {
+  if (value === "tokenClaim") {
+    return "token claim";
+  }
+
+  return value;
+}
+
 function formatTimestamp(value: string | null): string {
   if (!value) {
     return "not available";
@@ -833,6 +1158,31 @@ function formatTimestamp(value: string | null): string {
   }
 
   return parsed.toLocaleString();
+}
+
+function formatError(cause: unknown): string {
+  if (cause instanceof Error) {
+    return cause.message;
+  }
+
+  if (typeof cause === "string") {
+    return cause;
+  }
+
+  if (cause && typeof cause === "object") {
+    const shaped = cause as { message?: unknown };
+    if (typeof shaped.message === "string" && shaped.message.trim()) {
+      return shaped.message;
+    }
+
+    try {
+      return JSON.stringify(cause);
+    } catch {
+      return String(cause);
+    }
+  }
+
+  return String(cause);
 }
 
 export default App;

@@ -94,6 +94,15 @@ pub enum BirthError {
     Rejected { status: u16, body: String },
 }
 
+impl BirthError {
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            BirthError::Rejected { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}
+
 pub async fn fetch_birth(config: &SaoClientConfig) -> Result<BirthResponse, BirthError> {
     let url = format!("{}/api/orion/birth", config.base_url);
     let client = reqwest::Client::builder()
@@ -122,4 +131,38 @@ pub async fn fetch_birth(config: &SaoClientConfig) -> Result<BirthResponse, Birt
     }
 
     serde_json::from_str(&text).map_err(|e| BirthError::Parse(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn spawn_mock_server(response: &'static str) -> String {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        base_url
+    }
+
+    #[tokio::test]
+    async fn fetch_birth_preserves_rejected_status_code() {
+        let base_url = spawn_mock_server(
+            "HTTP/1.1 403 Forbidden\r\ncontent-length: 26\r\nconnection: close\r\n\r\n{\"error\":\"token rejected\"}",
+        );
+        let config = SaoClientConfig {
+            base_url,
+            bearer_token: "expired".to_string(),
+            agent_id: None,
+        };
+
+        let error = fetch_birth(&config).await.unwrap_err();
+        assert_eq!(error.status_code(), Some(403));
+    }
 }

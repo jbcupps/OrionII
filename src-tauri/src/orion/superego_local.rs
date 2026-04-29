@@ -16,6 +16,7 @@
 //! This module is intentionally only the local stub.
 
 use tauri::async_runtime::JoinHandle;
+use tracing::{error, warn};
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
 use crate::orion::payloads::SuperegoLocalEvaluation;
@@ -27,7 +28,7 @@ pub fn spawn(bus: SharedBus) -> JoinHandle<()> {
             match rx.recv().await {
                 Ok(env) => publish_evaluation(&bus, env).await,
                 Err(RecvError::Lagged(skipped)) => {
-                    eprintln!("[superego-local] lagged on EgoAction, skipped {skipped} envelopes");
+                    warn!(target: "orion::superego_local", skipped, "lagged on EgoAction");
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -53,6 +54,6 @@ async fn publish_evaluation(bus: &SharedBus, env: Envelope) {
         value,
     );
     if let Err(error) = bus.publish(envelope).await {
-        eprintln!("[superego-local] failed to publish evaluation: {error}");
+        error!(target: "orion::superego_local", %error, "failed to publish evaluation");
     }
 }
