@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use tauri::async_runtime::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
@@ -135,8 +135,15 @@ fn record_ego_action(
     );
 }
 
+#[instrument(skip(persistence, message), fields(correlation_id = ?message.correlation_id))]
 fn record_message(persistence: &Arc<Mutex<FilePersistence>>, message: &Message) {
-    let mut p = persistence.lock().expect("persistence mutex poisoned");
+    let mut p = match persistence.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            error!(target: "orion::journal", "persistence mutex poisoned in record_message; recovering");
+            poisoned.into_inner()
+        }
+    };
     if let Err(error) = p.record_message(message) {
         error!(target: "orion::journal", %error, "failed to record message");
     }

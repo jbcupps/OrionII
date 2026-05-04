@@ -28,6 +28,15 @@ pub struct IdReactionPayload {
 pub struct EgoActionPayload {
     pub user_query: String,
     pub response_text: String,
+    /// Added for chat reliability: "success", "degraded", or "error". Allows UI to
+    /// distinguish normal replies from timeouts/model-failures without silent drops.
+    #[serde(default = "default_status")]
+    pub status: String,
+    pub error: Option<String>,
+}
+
+fn default_status() -> String {
+    "success".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

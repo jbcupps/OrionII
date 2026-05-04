@@ -27,4 +27,4 @@ pub mod skills;
 pub mod superego_local;
 pub mod topics;
 
-pub use service::{ChatExchange, OrionCore};
+pub use service::{ChatExchange, OrionCore, EGO_ACTION_EVENT};

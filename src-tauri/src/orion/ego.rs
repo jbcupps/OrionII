@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tauri::async_runtime::JoinHandle;
 use tokio::time::error::Elapsed;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::orion::bus::{Envelope, RecvError, SharedBus, Topic};
 use crate::orion::ethics::{EthicsOverlay, EthicsOverlaySource};
@@ -72,6 +72,7 @@ pub fn spawn(bus: SharedBus, model: Arc<ModelRouter>) -> JoinHandle<()> {
     })
 }
 
+#[instrument(skip(bus, model), fields(correlation_id = ?env.correlation_id))]
 async fn handle_id_reaction(bus: &SharedBus, model: &Arc<ModelRouter>, env: Envelope) {
     let Ok(reaction) = serde_json::from_value::<IdReactionPayload>(env.payload.clone()) else {
         warn!(
@@ -103,9 +104,21 @@ async fn handle_id_reaction(bus: &SharedBus, model: &Arc<ModelRouter>, env: Enve
         .respond_text(&prompt, &ethics, model.as_ref())
         .await;
 
+    let status = if response_text.contains("degraded") || response_text.contains("timed out") {
+        "degraded".to_string()
+    } else {
+        "success".to_string()
+    };
+    let error = if status == "degraded" {
+        Some(response_text.clone()) // or extract detail
+    } else {
+        None
+    };
     let action = EgoActionPayload {
         user_query: reaction.user_query,
         response_text,
+        status,
+        error,
     };
     let value = serde_json::to_value(&action).unwrap_or(serde_json::Value::Null);
 

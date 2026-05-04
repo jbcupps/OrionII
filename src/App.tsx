@@ -2,6 +2,8 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import Commissioning, { CommissioningStateView } from "./Commissioning";
 import {
@@ -25,8 +27,10 @@ import {
 // After the EventBus refactor (see OrionII/docs/ADR-001), the chat surface
 // no longer awaits a `ChatExchange` return value from `send_chat_message`.
 // The command returns immediately with a correlation id; the assistant
-// reply arrives asynchronously on the `orion://ego/action` Tauri event,
-// emitted by the UI emitter subscriber on `Topic::EgoAction`.
+// reply arrives asynchronously on the `orion://ego/action` Tauri event
+// (see shared const `orion::EGO_ACTION_EVENT` re-exported from service.rs
+// via orion/mod.rs; the TS const ORION_EGO_ACTION_EVENT must match exactly).
+// Emitted by the UI emitter subscriber on `Topic::EgoAction`.
 
 type ChatAck = {
   correlationId: string;
@@ -37,6 +41,8 @@ type EgoActionEvent = {
   correlationId: string | null;
   userQuery: string;
   responseText: string;
+  status: string;
+  error: string | null;
 };
 
 type ModelStatus = {
@@ -230,26 +236,51 @@ function App() {
 
   // Subscribe to `orion://ego/action` once at mount. This is the architectural
   // inversion: chat output flows through the bus, not through a command return.
+  // Improved with strict correlation matching, dedup, status-based UX (degraded
+  // errors now surface), and Markdown rendering for agent responses.
   useEffect(() => {
     const unlistenPromise = listen<EgoActionEvent>(ORION_EGO_ACTION_EVENT, (event) => {
       const payload = event.payload;
-      setHistory((current) => [
-        ...current,
-        {
-          id: `${payload.correlationId ?? crypto.randomUUID()}-agent`,
-          role: "agent",
-          text: payload.responseText,
-          topic: "ego.action",
-          correlationId: payload.correlationId ?? "(unlinked)"
-        }
-      ]);
-      setIsSending(false);
-      setPendingCorrelationId((current) =>
-        current && payload.correlationId === current ? null : current
-      );
-      setStatus("Ego action received");
+      const correlationId = payload.correlationId;
 
-      // Refresh persistence-derived status after each ego response.
+      setHistory((current) => {
+        // Dedup by correlationId to prevent duplicate bubbles from out-of-order
+        // or replayed EgoActions (common in NATS/JetStream durable mode).
+        const last = current[current.length - 1];
+        if (last && last.correlationId === correlationId && last.role === "agent") {
+          return current;
+        }
+        return [
+          ...current,
+          {
+            id: `${correlationId ?? crypto.randomUUID()}-agent`,
+            role: "agent",
+            text: payload.responseText,
+            topic: "ego.action",
+            correlationId: correlationId ?? "(unlinked)"
+          }
+        ];
+      });
+
+      // Strict matching: only clear sending/pending for the expected correlation.
+      // This fixes races with concurrent sends or out-of-order events.
+      if (correlationId) {
+        setPendingCorrelationId((current) =>
+          current === correlationId ? null : current
+        );
+        if (payload.status !== "success" && payload.error) {
+          setError(payload.error);
+          setStatus(`Degraded response (${payload.status})`);
+        } else {
+          setStatus("Ego action received");
+        }
+        setIsSending(false);
+      } else {
+        setIsSending(false);
+      }
+
+      // Refresh persistence-derived status (journal, lastEgoActionAt, etc.)
+      // after each ego response.
       invoke<CompanionStatusReport>("companion_status")
         .then(setCompanionStatus)
         .catch(() => {
@@ -696,7 +727,16 @@ function ChatPanel({
                 <span>{message.role === "user" ? "You" : agentTitle}</span>
                 <code>{message.topic}</code>
               </div>
-              <p>{message.text}</p>
+              {message.role === "agent" ? (
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  className="prose prose-sm max-w-none dark:prose-invert"
+                >
+                  {message.text}
+                </ReactMarkdown>
+              ) : (
+                <p>{message.text}</p>
+              )}
               <small>correlation {message.correlationId}</small>
             </article>
           ))

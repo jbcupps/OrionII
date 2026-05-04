@@ -6,7 +6,7 @@ use serde_json::json;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::{error, instrument, warn};
 use uuid::Uuid;
 
 use crate::orion::birth::BirthResponse;
@@ -28,12 +28,14 @@ use crate::orion::security::{ConstitutionalVerifier, SecurityHealth};
 use crate::orion::skills::{DocumentSkill, OAuthSkillCatalog, SkillAuthorization};
 use crate::orion::{ego, egress, governance, id, superego_local};
 
-const UI_EGO_ACTION_EVENT: &str = "orion://ego/action";
+pub const EGO_ACTION_EVENT: &str = "orion://ego/action";
 
 #[derive(Debug, Error)]
 pub enum OrionError {
     #[error("message text cannot be empty")]
     EmptyMessage,
+    #[error("mutex/rwlock poisoned (bug in lock usage) — hot-swap core recommended")]
+    PoisonedLock,
     #[error(transparent)]
     Bus(#[from] BusError),
     #[error(transparent)]
@@ -151,13 +153,25 @@ impl OrionCore {
         // subscribers below don't change shape between them. Any failure
         // in a durable broker path falls back to the in-memory bus with a
         // diagnostic log — the entity stays alive even if the broker
-        // doesn't.
+        // doesn't. Locks hardened with poison-recovery to prevent task crashes.
         let orion_id = {
-            let p = persistence.lock().expect("persistence mutex poisoned");
+            let p = match persistence.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    error!(target: "orion::core", "persistence mutex poisoned during build; recovering");
+                    poisoned.into_inner()
+                }
+            };
             p.identity().identity.orion_id
         };
         let supervisor_soul_ref = {
-            let c = charter.read().expect("charter rwlock poisoned");
+            let c = match charter.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    error!(target: "orion::core", "charter rwlock poisoned during build; recovering");
+                    poisoned.into_inner()
+                }
+            };
             current_soul_ref(&c)
         };
 
@@ -334,6 +348,7 @@ impl OrionCore {
     /// Publish a `MentorInput` envelope and return immediately. The Ego
     /// response arrives later as a Tauri event — see ADR-001 § "UI
     /// inversion".
+    #[instrument(skip(self), fields(text_len = text.trim().len()))]
     pub async fn send_chat_message(&self, text: String) -> Result<ChatExchange, OrionError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -342,11 +357,11 @@ impl OrionCore {
 
         let correlation_id = Uuid::new_v4();
         let agent_id = {
-            let p = self.persistence.lock().expect("persistence mutex poisoned");
+            let p = self.persistence.lock().map_err(|_| OrionError::PoisonedLock)?;
             p.identity().identity.orion_id.to_string()
         };
         let soul_ref = {
-            let c = self.charter.read().expect("charter rwlock poisoned");
+            let c = self.charter.read().map_err(|_| OrionError::PoisonedLock)?;
             current_soul_ref(&c)
         };
 
@@ -373,7 +388,7 @@ impl OrionCore {
     ) -> Result<usize, OrionError> {
         let chunks = self.documents.chunk_document(source_path, &contents);
         let count = chunks.len();
-        let mut p = self.persistence.lock().expect("persistence mutex poisoned");
+        let mut p = self.persistence.lock().map_err(|_| OrionError::PoisonedLock)?;
         p.add_document_chunks(chunks)?;
         Ok(count)
     }
@@ -390,7 +405,7 @@ impl OrionCore {
         let policy = match policy_client.fetch_policy().await {
             Ok(policy) => policy,
             Err(SaoClientError::NotConfigured) => {
-                let p = self.persistence.lock().expect("persistence mutex poisoned");
+                let p = self.persistence.lock().map_err(|_| OrionError::PoisonedLock)?;
                 let current = p.policy();
                 crate::orion::sao::PolicyOverlay {
                     version: current.version + 1,
@@ -404,11 +419,11 @@ impl OrionCore {
 
         let new_version = policy.version;
         let agent_id = {
-            let p = self.persistence.lock().expect("persistence mutex poisoned");
+            let p = self.persistence.lock().map_err(|_| OrionError::PoisonedLock)?;
             p.identity().identity.orion_id.to_string()
         };
         let soul_ref = {
-            let c = self.charter.read().expect("charter rwlock poisoned");
+            let c = self.charter.read().map_err(|_| OrionError::PoisonedLock)?;
             current_soul_ref(&c)
         };
         let payload = json!({
@@ -451,7 +466,13 @@ impl OrionCore {
     }
 
     pub fn companion_status(&self) -> CompanionStatusReport {
-        let p = self.persistence.lock().expect("persistence mutex poisoned");
+        let p = match self.persistence.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!(target: "orion::core", "persistence mutex poisoned in companion_status; recovering");
+                poisoned.into_inner()
+            }
+        };
         let security = self.verifier.verify("local constitutional scaffold", None);
         CompanionStatusReport {
             companion_id: p.identity().identity.orion_id,
@@ -475,15 +496,18 @@ impl Drop for OrionCore {
 }
 
 /// UI emitter subscriber. Listens on `Topic::EgoAction` and forwards each
-/// envelope to the React app via a Tauri event. This is the only
-/// Rust→React bridge for chat output — the UI does not consume the
-/// `send_chat_message` return value for the assistant reply.
+/// envelope to the React app via Tauri event `EGO_ACTION_EVENT` (the single
+/// shared const re-exported from this module). This is the only Rust→React
+/// bridge for chat output per ADR-001 "UI inversion" — the UI does not consume
+/// the `send_chat_message` return value for the assistant reply.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UiEgoActionEvent {
     correlation_id: Option<Uuid>,
     user_query: String,
     response_text: String,
+    status: String,
+    error: Option<String>,
 }
 
 struct BusSelection {
@@ -647,6 +671,8 @@ fn build_ui_event(env: &Envelope) -> Option<UiEgoActionEvent> {
         correlation_id: env.correlation_id,
         user_query: action.user_query,
         response_text: action.response_text,
+        status: action.status,
+        error: action.error,
     })
 }
 
@@ -664,7 +690,7 @@ fn spawn_ui_emitter(bus: SharedBus, app: AppHandle) -> JoinHandle<()> {
                         );
                         continue;
                     };
-                    if let Err(cause) = app.emit(UI_EGO_ACTION_EVENT, &event) {
+                    if let Err(cause) = app.emit(EGO_ACTION_EVENT, &event) {
                         error!(
                             target: "orion::ui_emitter",
                             correlation_id = ?env.correlation_id,
@@ -695,8 +721,8 @@ mod tests {
     use tokio::time::timeout;
 
     #[test]
-    fn ui_ego_action_event_name_uses_tauri_safe_chars() {
-        assert!(UI_EGO_ACTION_EVENT
+    fn ego_action_event_name_uses_tauri_safe_chars() {
+        assert!(EGO_ACTION_EVENT
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '/' | ':' | '_')));
     }
@@ -706,12 +732,15 @@ mod tests {
         let payload = serde_json::to_value(&EgoActionPayload {
             user_query: "hi".to_string(),
             response_text: "hello".to_string(),
+            status: "success".to_string(),
+            error: None,
         })
         .unwrap();
         // Sanity-check that the payload on the wire is camelCase, since the
         // React listener types these fields as `userQuery` / `responseText`.
         assert!(payload.get("userQuery").is_some());
         assert!(payload.get("responseText").is_some());
+        assert!(payload.get("status").is_some());
 
         let cid = Uuid::new_v4();
         let env = Envelope::new(Topic::EgoAction, "agent-1", "soul:v1", Some(cid), payload);
@@ -720,6 +749,8 @@ mod tests {
         assert_eq!(event.correlation_id, Some(cid));
         assert_eq!(event.user_query, "hi");
         assert_eq!(event.response_text, "hello");
+        assert_eq!(event.status, "success");
+        assert!(event.error.is_none());
 
         // The event re-serializes camelCase too (UiEgoActionEvent has
         // `rename_all = "camelCase"`); the React listener depends on this.
@@ -727,6 +758,7 @@ mod tests {
         assert!(serialized.get("correlationId").is_some());
         assert!(serialized.get("userQuery").is_some());
         assert!(serialized.get("responseText").is_some());
+        assert!(serialized.get("status").is_some());
     }
 
     #[test]

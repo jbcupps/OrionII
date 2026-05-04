@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 mod orion;
 
 use orion::commissioning_client::CommissioningError;
+pub use orion::EGO_ACTION_EVENT;
 
 /// Initialise the tracing subscriber once at process start. The default
 /// filter is `info` for OrionII modules and `warn` for everything else;

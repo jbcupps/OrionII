@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tauri::async_runtime::JoinHandle;
 use tokio::time::error::Elapsed;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::orion::bus::{current_soul_ref, Envelope, RecvError, SharedBus, Topic};
 use crate::orion::charter::SharedCharter;
@@ -43,6 +43,7 @@ pub fn spawn(
     })
 }
 
+#[instrument(skip(bus, persistence, model, charter), fields(correlation_id = ?env.correlation_id))]
 async fn handle_mentor_input(
     bus: &SharedBus,
     persistence: &Arc<Mutex<FilePersistence>>,
@@ -73,15 +74,37 @@ async fn handle_mentor_input(
     let curator = CuratorRuntime::default();
 
     // Lock briefly to clone the identity and retrieve document context.
-    // Release before .await on the model.
+    // Release before .await on the model. Use poison-recovery pattern to
+    // harden against rare mutex poisoning without crashing the Id subscriber task
+    // (per chat reliability fixes). Always ensures IdReaction is published.
     let (identity, document_context) = {
-        let p = persistence.lock().expect("persistence mutex poisoned");
+        let p = match persistence.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!(
+                    target: "orion::id",
+                    correlation_id = ?correlation_id,
+                    "persistence mutex poisoned; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
         let identity = p.identity().clone();
         let document_context = curator.retrieve_documents(&user_query, p.document_chunks());
         (identity, document_context)
     };
     let soul_ref = {
-        let c = charter.read().expect("charter rwlock poisoned");
+        let c = match charter.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!(
+                    target: "orion::id",
+                    correlation_id = ?correlation_id,
+                    "charter rwlock poisoned; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
         current_soul_ref(&c)
     };
 
