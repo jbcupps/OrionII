@@ -170,28 +170,35 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $tag = 'edge'
-          $title = "OrionII edge ($PRODUCT_VERSION-$($env:GITHUB_SHA.Substring(0,7)))"
-          $notesPath = Join-Path $env:RUNNER_TEMP 'edge-notes.md'
+          # PowerShell here-strings reference env-block variables as $env:NAME, not $NAME.
+          # Snapshot the workflow env vars into local PS variables so the body interpolates them.
+          $msiName = $env:MSI_NAME
+          $msiSha = $env:MSI_SHA256
+          $productVersion = $env:PRODUCT_VERSION
           $sha = $env:GITHUB_SHA
           $shortSha = $sha.Substring(0,7)
-          $runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $repo = $env:GITHUB_REPOSITORY
+          $runUrl = "https://github.com/$repo/actions/runs/$env:GITHUB_RUN_ID"
+
+          $tag = 'edge'
+          $title = "OrionII edge ($productVersion-$shortSha)"
+          $notesPath = Join-Path $env:RUNNER_TEMP 'edge-notes.md'
           $body = @"
           OrionII rolling edge build.
 
-          - Product version: $PRODUCT_VERSION
+          - Product version: $productVersion
           - Commit: $sha
           - Build run: $runUrl
-          - sha256 ($MSI_NAME): ``$MSI_SHA256``
+          - sha256 ($msiName): ``$msiSha``
 
           This release is replaced on every push to ``main`` and on the nightly
           rebuild schedule. It is marked as a prerelease so it never overrides
           the most recent tagged stable release at ``releases/latest``. Use
           this URL for an always-current build:
 
-          ``https://github.com/$env:GITHUB_REPOSITORY/releases/download/edge/$MSI_NAME``
+          ``https://github.com/$repo/releases/download/edge/$msiName``
 
-          Verify the download with the sibling ``$MSI_NAME.sha256`` file or the
+          Verify the download with the sibling ``$msiName.sha256`` file or the
           digest above. SAO's /admin/installer-sources Probe button should
           recognise the bytes as a valid Windows Installer (.msi).
           "@
