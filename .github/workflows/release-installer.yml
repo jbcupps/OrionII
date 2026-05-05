@@ -1,18 +1,57 @@
 name: Build OrionII installer
 
+# Goal: keep an OrionII MSI always available and current.
+#
+# Trigger matrix:
+#   push tags 'v*'        -> stable tagged release  (releases/latest/download/...msi)
+#   push branches 'main'  -> rolling 'edge' release (releases/download/edge/...msi)
+#   schedule (nightly)    -> rebuild edge to catch upstream regressions
+#                            (e.g. NATS sidecar archive rotation) before users do
+#   pull_request          -> build-only check, no publish
+#   workflow_dispatch     -> manual rebuild + publish to edge (or tag if 'tag' input)
+#
+# Each successful build also publishes <asset>.sha256 alongside the MSI so SAO's
+# /admin/installer-sources flow can independently verify the digest before
+# accepting the URL into its installer-source registry.
+
 on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # 07:00 UTC daily — catches upstream NATS / Tauri / WiX changes overnight
+    # and surfaces them in the actions tab before the first user opens SAO.
+    - cron: '0 7 * * *'
   workflow_dispatch:
+    inputs:
+      publish_edge:
+        description: 'Publish to the rolling edge release after a manual build'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+
+# Don't pile up redundant rolling/PR builds. Tag builds get their own group so
+# a tag push is never cancelled by a concurrent main push.
+concurrency:
+  group: release-installer-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 jobs:
   build-msi:
     name: Build Tauri MSI
     runs-on: windows-latest
+
+    outputs:
+      msi_name: ${{ steps.collect.outputs.msi_name }}
+      msi_sha256: ${{ steps.collect.outputs.msi_sha256 }}
+      product_version: ${{ steps.collect.outputs.product_version }}
 
     steps:
       - name: Checkout
@@ -27,25 +66,200 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          # Distinguish edge / pr / tag caches so PR experiments don't poison
+          # the main-branch artifact cache.
+          shared-key: orionii-msi-${{ github.event_name }}
+
       - name: Install dependencies
         run: npm ci
 
       - name: Build Tauri MSI with bundled NATS JetStream sidecar
         shell: pwsh
         env:
+          # Optional repo-level overrides for the bundled NATS server. Empty values
+          # fall back to the upstream nats-io release defaults inside the script.
           ORIONII_NATS_SERVER_URL: ${{ vars.ORIONII_NATS_SERVER_URL }}
           ORIONII_NATS_SERVER_SHA256: ${{ vars.ORIONII_NATS_SERVER_SHA256 }}
         run: .\scripts\build-installer.ps1 -Bundles msi
 
-      - name: Upload artifact
+      - name: Verify MSI magic bytes (D0 CF 11 E0 ...)
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path src-tauri/target/release/bundle/msi -Filter *.msi -File |
+                 Select-Object -First 1
+          if (-not $msi) { throw "No MSI was produced under src-tauri/target/release/bundle/msi." }
+          $bytes = [System.IO.File]::ReadAllBytes($msi.FullName)[0..7]
+          $magic = ([System.BitConverter]::ToString($bytes)).Replace('-', '').ToLower()
+          if ($magic -ne 'd0cf11e0a1b11ae1') {
+            throw "MSI does not start with the OLE2 magic signature. Got 0x$magic. Aborting before publish."
+          }
+          Write-Host "OK: MSI magic verified (0x$magic) on $($msi.Name)."
+
+      - name: Compute sha256 sidecar files
+        shell: pwsh
+        run: |
+          $msis = Get-ChildItem -Path src-tauri/target/release/bundle/msi -Filter *.msi -File
+          foreach ($m in $msis) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $m.FullName).Hash.ToLowerInvariant()
+            $line = "$hash  $($m.Name)"
+            $sidecar = "$($m.FullName).sha256"
+            Set-Content -LiteralPath $sidecar -Value $line -Encoding ASCII
+            Write-Host "Wrote $sidecar : $line"
+          }
+
+      - name: Collect build metadata
+        id: collect
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path src-tauri/target/release/bundle/msi -Filter *.msi -File |
+                 Select-Object -First 1
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $msi.FullName).Hash.ToLowerInvariant()
+          $tauriConfig = Get-Content -Raw -Path src-tauri/tauri.conf.json | ConvertFrom-Json
+          $version = $tauriConfig.version
+          "msi_name=$($msi.Name)"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          "msi_sha256=$hash"             | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          "product_version=$version"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OrionII-MSI
-          path: src-tauri/target/release/bundle/msi/*.msi
+          name: OrionII-MSI-${{ github.run_id }}
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.sha256
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Publish to release on tag
+      # ---------- Tagged stable release ----------
+      - name: Publish to tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: src-tauri/target/release/bundle/msi/*.msi
+          files: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      # ---------- Rolling edge release ----------
+      #
+      # Why a separate "edge" release rather than uploading to "latest":
+      #   - GitHub's `releases/latest/download/<asset>` redirects to the most
+      #     recently *published* non-prerelease release. We deliberately mark
+      #     edge as a prerelease so it never displaces a tagged stable release
+      #     while still giving SAO a stable URL via
+      #     `releases/download/edge/<asset>`.
+      #   - This means SAO operators have two predictable, durable URLs:
+      #       stable: releases/latest/download/OrionII_<v>_x64_en-US.msi
+      #       edge:   releases/download/edge/OrionII_<v>_x64_en-US.msi
+      - name: Publish to edge rolling release
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish_edge)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MSI_NAME: ${{ steps.collect.outputs.msi_name }}
+          MSI_SHA256: ${{ steps.collect.outputs.msi_sha256 }}
+          PRODUCT_VERSION: ${{ steps.collect.outputs.product_version }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = 'edge'
+          $title = "OrionII edge ($PRODUCT_VERSION-$($env:GITHUB_SHA.Substring(0,7)))"
+          $notesPath = Join-Path $env:RUNNER_TEMP 'edge-notes.md'
+          $sha = $env:GITHUB_SHA
+          $shortSha = $sha.Substring(0,7)
+          $runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $body = @"
+          OrionII rolling edge build.
+
+          - Product version: $PRODUCT_VERSION
+          - Commit: $sha
+          - Build run: $runUrl
+          - sha256 ($MSI_NAME): ``$MSI_SHA256``
+
+          This release is replaced on every push to ``main`` and on the nightly
+          rebuild schedule. It is marked as a prerelease so it never overrides
+          the most recent tagged stable release at ``releases/latest``. Use
+          this URL for an always-current build:
+
+          ``https://github.com/$env:GITHUB_REPOSITORY/releases/download/edge/$MSI_NAME``
+
+          Verify the download with the sibling ``$MSI_NAME.sha256`` file or the
+          digest above. SAO's /admin/installer-sources Probe button should
+          recognise the bytes as a valid Windows Installer (.msi).
+          "@
+          Set-Content -LiteralPath $notesPath -Value $body -Encoding utf8
+
+          # Ensure the edge tag points at this commit. Force-update if it exists.
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config --global user.name 'github-actions[bot]'
+          git tag -f $tag $sha
+          git push origin "refs/tags/$tag" --force
+
+          # Replace the existing edge release in place. We delete first so the
+          # asset URL is never momentarily missing (gh release edit doesn't
+          # truncate assets, and re-uploading with the same filename errors).
+          $existing = gh release view $tag --json assets --jq '.assets[].name' 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Removing previous edge assets..."
+            foreach ($asset in ($existing -split "`n" | Where-Object { $_ })) {
+              gh release delete-asset $tag $asset --yes
+            }
+            gh release edit $tag `
+              --title $title `
+              --notes-file $notesPath `
+              --prerelease `
+              --draft=false
+          }
+          else {
+            Write-Host "Creating new edge release..."
+            gh release create $tag `
+              --title $title `
+              --notes-file $notesPath `
+              --prerelease `
+              --target $sha
+          }
+
+          gh release upload $tag `
+            (Get-ChildItem 'src-tauri/target/release/bundle/msi/*.msi').FullName `
+            (Get-ChildItem 'src-tauri/target/release/bundle/msi/*.sha256').FullName `
+            --clobber
+
+      - name: Summarize artifact URLs
+        if: always() && steps.collect.outputs.msi_name != ''
+        shell: pwsh
+        run: |
+          $name = '${{ steps.collect.outputs.msi_name }}'
+          $sha = '${{ steps.collect.outputs.msi_sha256 }}'
+          $repo = $env:GITHUB_REPOSITORY
+          $lines = @()
+          $lines += "## OrionII installer build"
+          $lines += ""
+          $lines += "- Asset: ``$name``"
+          $lines += "- sha256: ``$sha``"
+          $lines += ""
+          if ('${{ github.event_name }}' -eq 'pull_request') {
+            $lines += "PR build only — not published. Inspect the workflow artifact above."
+          }
+          elseif ('${{ github.ref }}' -like 'refs/tags/v*') {
+            $tag = '${{ github.ref_name }}'
+            $lines += "Tagged stable release URL: <https://github.com/$repo/releases/download/$tag/$name>"
+            $lines += ""
+            $lines += "Latest stable alias (works after this is the newest tagged release):"
+            $lines += "<https://github.com/$repo/releases/latest/download/$name>"
+          }
+          else {
+            $lines += "Edge rolling release URL: <https://github.com/$repo/releases/download/edge/$name>"
+            $lines += ""
+            $lines += "Sha256 sidecar: <https://github.com/$repo/releases/download/edge/$name.sha256>"
+          }
+          $lines += ""
+          $lines += "Register either URL in SAO under /admin/installer-sources. SAO's probe step will verify the bytes are a valid Windows Installer before persisting."
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
