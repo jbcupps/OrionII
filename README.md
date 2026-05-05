@@ -70,17 +70,28 @@ directly to local Ollama. Useful for iterating without rebuilding the MSI.
 
 ```powershell
 npm ci
-npm run tauri build -- --bundles msi
+npm run build:installer
 ```
 
-Output: `src-tauri/target/release/bundle/msi/OrionII_<version>_x64_en-US.msi`.
+Output: `src-tauri/target/release/bundle/msi/OrionII_<version>_x64_en-US.msi` plus a
+sibling `OrionII_<version>_x64_en-US.msi.sha256` published by CI.
 
-This is the artifact SAO's installer-source registry serves. Either:
+This is the artifact SAO's installer-source registry serves. CI keeps an MSI always
+available through three channels — pick whichever matches your stability needs:
 
-- Publish via GitHub Actions ([release-installer.yml](.github/workflows/release-installer.yml))
-  on tag, then point a SAO installer source at `https://github.com/jbcupps/OrionII/releases/latest/download/<asset>`.
-- Or in dev, run a temporary HTTP server on the build dir and probe its sha into a SAO
-  installer source — see the SAO runbook.
+| Channel | URL | When it's updated |
+| --- | --- | --- |
+| Tag-stable | `https://github.com/jbcupps/OrionII/releases/latest/download/OrionII_<v>_x64_en-US.msi` | When a `vX.Y.Z` tag is pushed |
+| Edge rolling | `https://github.com/jbcupps/OrionII/releases/download/edge/OrionII_<v>_x64_en-US.msi` | Every push to `main` and the nightly cron rebuild |
+| Workflow artifact | Actions tab → run → "OrionII-MSI-..." artifact | Every workflow run, including PR previews |
+
+Each MSI ships with a sibling `<msi>.sha256` file. SAO's `/admin/installer-sources`
+**Probe sha256** button validates the bytes are a real Windows Installer (OLE2 magic)
+and refuses to register source-tarball ZIPs or HTML error pages.
+
+The pipeline lives in [`.github/workflows/release-installer.yml`](.github/workflows/release-installer.yml).
+On PRs it runs the full MSI build as a check (so a contributor whose change breaks the
+installer pipeline finds out before merge), but does not publish.
 
 ## Project Layout
 

@@ -1,5 +1,12 @@
 name: CI
 
+# Fast feedback: type-check + test the Rust crate and frontend.
+# The full Tauri MSI build runs in release-installer.yml on the same triggers
+# (pull_request to main, push to main, tag pushes) so contributors see both:
+#   - "the code compiles + tests pass" here, in seconds
+#   - "the installer pipeline still produces a valid MSI" there, in minutes
+# Runs concurrently on the same PR / push so neither blocks the other.
+
 on:
   push:
     branches:
@@ -8,6 +15,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -26,6 +37,12 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: orionii-ci
 
       - name: Install frontend dependencies
         run: npm ci
